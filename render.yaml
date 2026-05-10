@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: fx281-backend
+    name: fx281-studio-v12-backend
     runtime: python
     buildCommand: pip install -r backend/requirements-cloud.txt
     startCommand: cd backend && python main.py
