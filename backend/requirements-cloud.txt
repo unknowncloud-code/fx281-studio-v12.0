@@ -1,0 +1,29 @@
+# ============================================
+# FX281 Podcast Backend - Python Dependencies (Cloud)
+# ============================================
+
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# DashScope SDK (SenseVoice STT + file upload)
+dashscope
+
+# Qwen Chat (OpenAI-compatible mode)
+openai
+
+# HTTP client
+httpx
+
+# Data
+pydantic==2.9.2
+
+# Export
+python-docx
+pydub
+
+# ============================================
+# Install
+# ============================================
+# pip install -r requirements-cloud.txt

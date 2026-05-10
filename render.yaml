@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: fx281-backend
+    runtime: python
+    buildCommand: pip install -r backend/requirements-cloud.txt
+    startCommand: cd backend && python main.py
+    envVars:
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: ASR_MODE
+        value: dashscope
+      - key: PORT
+        value: 8000
