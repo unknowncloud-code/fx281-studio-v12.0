@@ -38,7 +38,7 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 import dashscope
 dashscope.api_key = DASHSCOPE_API_KEY
 
-QWEN_MODEL = "qwen-plus"
+QWEN_MODEL = "qwen-max"
 ASR_MODE = os.getenv("ASR_MODE", "local")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
