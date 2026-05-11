@@ -4,6 +4,15 @@ import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 
 const SPEAKER_COLORS = ['#1a1a1a', '#4a4a4a', '#7a7a7a', '#aaa', '#333', '#666'];
 
+const CLOUD_BACKEND = 'https://fx281-studio-v12-0-backend.onrender.com';
+const getApiBase = () => {
+  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    return CLOUD_BACKEND;
+  }
+  return '';
+};
+const API_BASE = typeof window !== 'undefined' ? getApiBase() : '';
+
 const REASON_LABELS = {
   filler: '口癖', echo: '附和', noise: '杂音', redundant: '冗余',
 };
@@ -236,7 +245,7 @@ export default function App() {
 
   const loadHistory = async () => {
     try {
-      const resp = await fetch('/api/history');
+      const resp = await fetch(`${API_BASE}/api/history`);
       if (resp.ok) {
         const data = await resp.json();
         setHistoryList(data);
@@ -249,7 +258,7 @@ export default function App() {
 
   const loadHistoryDetail = async (tid) => {
     try {
-      const resp = await fetch(`/api/history/${tid}`);
+      const resp = await fetch(`${API_BASE}/api/history/${tid}`);
       if (!resp.ok) throw new Error('加载失败');
       const data = await resp.json();
       const names = {};
@@ -275,7 +284,7 @@ export default function App() {
 
   const deleteHistory = async (tid) => {
     try {
-      const resp = await fetch(`/api/history/${tid}`, { method: 'DELETE' });
+      const resp = await fetch(`${API_BASE}/api/history/${tid}`, { method: 'DELETE' });
       if (!resp.ok) throw new Error('删除失败');
       setHistoryList(prev => prev.filter(h => h.task_id !== tid));
     } catch (e) {
@@ -311,7 +320,7 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const uploadResp = await fetch('/api/process-audio', { method: 'POST', body: formData });
+      const uploadResp = await fetch(`${API_BASE}/api/process-audio`, { method: 'POST', body: formData });
       if (!uploadResp.ok) throw new Error(`上传失败 (${uploadResp.status})`);
       const uploadData = await uploadResp.json();
       const tid = uploadData.task_id;
@@ -325,7 +334,7 @@ export default function App() {
 
       while (Date.now() - startTime < maxTime) {
         try {
-          const resp = await fetch(`/api/task/${tid}`);
+          const resp = await fetch(`${API_BASE}/api/task/${tid}`);
           if (!resp.ok) throw new Error('查询失败');
           const data = await resp.json();
           if (data.status === 'completed') {
@@ -388,7 +397,7 @@ export default function App() {
   const handleExportWord = async () => {
     if (!taskId) return;
     try {
-      const resp = await fetch(`/api/export/word/${taskId}`, { method: 'POST' });
+      const resp = await fetch(`${API_BASE}/api/export/word/${taskId}`, { method: 'POST' });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `导出失败 (${resp.status})`);
@@ -404,7 +413,7 @@ export default function App() {
   const handleExportMp3 = async () => {
     if (!taskId) return;
     try {
-      const resp = await fetch(`/api/export/mp3/${taskId}`, { method: 'POST' });
+      const resp = await fetch(`${API_BASE}/api/export/mp3/${taskId}`, { method: 'POST' });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `导出失败 (${resp.status})`);

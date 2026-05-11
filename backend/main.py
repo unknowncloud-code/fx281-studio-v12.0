@@ -412,7 +412,7 @@ async def _local_transcribe(file_path: str, task_id: str) -> List[dict]:
 # DashScope ASR (fallback)
 # ============================================
 async def _upload_to_dashscope_oss(file_path: str, filename: str) -> str:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=120.0, write=300.0, pool=30.0)) as http_client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=60.0, read=300.0, write=600.0, pool=60.0)) as http_client:
         policy_resp = await http_client.get(
             "https://dashscope.aliyuncs.com/api/v1/uploads",
             headers={"Authorization": f"Bearer {DASHSCOPE_API_KEY}"},
@@ -446,7 +446,7 @@ async def _upload_to_dashscope_oss(file_path: str, filename: str) -> str:
 
 async def _dashscope_transcribe(file_path: str, filename: str, task_id: str) -> List[dict]:
     oss_url = await _upload_to_dashscope_oss(file_path, filename)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=120.0, write=60.0, pool=30.0)) as http_client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=60.0, read=300.0, write=120.0, pool=60.0)) as http_client:
         submit_resp = await http_client.post(
             "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
             headers={
