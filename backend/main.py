@@ -33,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "REDACTED")
 
 import dashscope
 dashscope.api_key = DASHSCOPE_API_KEY
