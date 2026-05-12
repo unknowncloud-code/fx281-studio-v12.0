@@ -28,7 +28,7 @@ if sys.platform == "win32":
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("fx281")
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -966,6 +966,13 @@ def _generate_mp3(task_data: dict, original_file_path: str) -> str:
 # ============================================
 # API Routes
 # ============================================
+def _get_user_code(request: Request) -> str:
+    code = request.headers.get("X-User-Code", "").strip()
+    if not code or len(code) != 6 or not code.isdigit():
+        raise HTTPException(status_code=401, detail="请输入6位用户代码")
+    return code
+
+
 @app.get("/")
 async def root():
     return {
@@ -980,10 +987,13 @@ async def health_check():
 
 
 @app.get("/api/history")
-async def get_history():
+async def get_history(request: Request):
+    user_code = _get_user_code(request)
     history = _load_history()
     summaries = []
     for h in history:
+        if h.get("user_code") != user_code:
+            continue
         summaries.append({
             "task_id": h.get("task_id"),
             "filename": h.get("filename", ""),
@@ -997,19 +1007,28 @@ async def get_history():
 
 
 @app.get("/api/history/{task_id}")
-async def get_history_detail(task_id: str):
+async def get_history_detail(task_id: str, request: Request):
+    user_code = _get_user_code(request)
     record = _load_task_from_disk(task_id)
-    if not record:
+    if not record or record.get("user_code") != user_code:
         raise HTTPException(status_code=404, detail="Task not found in history")
     return JSONResponse(content=record)
 
 
 @app.delete("/api/history/{task_id}")
-async def delete_history(task_id: str):
+async def delete_history(task_id: str, request: Request):
+    user_code = _get_user_code(request)
     history = _load_history()
-    new_history = [h for h in history if h.get("task_id") != task_id]
-    if len(new_history) == len(history):
+    target = None
+    for h in history:
+        if h.get("task_id") == task_id:
+            if h.get("user_code") != user_code:
+                raise HTTPException(status_code=403, detail="无权删除此记录")
+            target = h
+            break
+    if not target:
         raise HTTPException(status_code=404, detail="Task not found in history")
+    new_history = [h for h in history if h.get("task_id") != task_id]
     try:
         with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(new_history, f, ensure_ascii=False, indent=2)
@@ -1021,9 +1040,11 @@ async def delete_history(task_id: str):
 
 
 @app.post("/api/process-audio")
-async def process_audio(file: UploadFile = File(...)):
+async def process_audio(request: Request, file: UploadFile = File(...)):
     if not file:
         raise HTTPException(status_code=400, detail="No file uploaded")
+
+    user_code = _get_user_code(request)
 
     allowed = ['.mp3', '.m4a', '.wav', '.flac', '.mp4', '.aac', '.ogg']
     ext = os.path.splitext(file.filename)[1].lower() if file.filename else ''
@@ -1050,6 +1071,7 @@ async def process_audio(file: UploadFile = File(...)):
         "error": None, "message": None, "filename": file.filename,
         "original_file": tmp,
         "created_at": datetime.now().isoformat(),
+        "user_code": user_code,
     }
     asyncio.create_task(_process_audio_task(task_id, tmp, file.filename))
     return JSONResponse(content={"task_id": task_id, "status": "uploaded"})

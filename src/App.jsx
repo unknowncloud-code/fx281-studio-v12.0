@@ -38,6 +38,8 @@ function formatTime(seconds) {
 }
 
 export default function App() {
+  const [userCode, setUserCode] = useState(() => localStorage.getItem('fx281_user_code') || '');
+  const [loginInput, setLoginInput] = useState('');
   const [workspaces, setWorkspaces] = useState([]);
   const [activeWsId, setActiveWsId] = useState(null);
   const [showExport, setShowExport] = useState(false);
@@ -57,6 +59,26 @@ export default function App() {
   const updateWs = useCallback((id, updates) => {
     setWorkspaces(prev => prev.map(w => w.id === id ? { ...w, ...updates } : w));
   }, []);
+
+  const apiHeaders = useCallback(() => ({
+    'X-User-Code': userCode,
+  }), [userCode]);
+
+  const handleLogin = () => {
+    const code = loginInput.trim();
+    if (code.length === 6 && /^\d{6}$/.test(code)) {
+      setUserCode(code);
+      localStorage.setItem('fx281_user_code', code);
+      setLoginInput('');
+    }
+  };
+
+  const handleLogout = () => {
+    setUserCode('');
+    localStorage.removeItem('fx281_user_code');
+    setWorkspaces([]);
+    setActiveWsId(null);
+  };
 
   const transcripts = activeWs?.transcripts || [];
   const speakers = activeWs?.speakers || [];
@@ -245,7 +267,7 @@ export default function App() {
 
   const loadHistory = async () => {
     try {
-      const resp = await fetch(`${API_BASE}/api/history`);
+      const resp = await fetch(`${API_BASE}/api/history`, { headers: apiHeaders() });
       if (resp.ok) {
         const data = await resp.json();
         setHistoryList(data);
@@ -258,7 +280,7 @@ export default function App() {
 
   const loadHistoryDetail = async (tid) => {
     try {
-      const resp = await fetch(`${API_BASE}/api/history/${tid}`);
+      const resp = await fetch(`${API_BASE}/api/history/${tid}`, { headers: apiHeaders() });
       if (!resp.ok) throw new Error('加载失败');
       const data = await resp.json();
       const names = {};
@@ -284,7 +306,7 @@ export default function App() {
 
   const deleteHistory = async (tid) => {
     try {
-      const resp = await fetch(`${API_BASE}/api/history/${tid}`, { method: 'DELETE' });
+      const resp = await fetch(`${API_BASE}/api/history/${tid}`, { method: 'DELETE', headers: apiHeaders() });
       if (!resp.ok) throw new Error('删除失败');
       setHistoryList(prev => prev.filter(h => h.task_id !== tid));
     } catch (e) {
@@ -328,6 +350,7 @@ export default function App() {
         method: 'POST',
         body: formData,
         signal: controller.signal,
+        headers: apiHeaders(),
       });
       clearTimeout(uploadTimeout);
       if (!uploadResp.ok) throw new Error(`上传失败 (${uploadResp.status})`);
@@ -343,7 +366,7 @@ export default function App() {
 
       while (Date.now() - startTime < maxTime) {
         try {
-          const resp = await fetch(`${API_BASE}/api/task/${tid}`);
+          const resp = await fetch(`${API_BASE}/api/task/${tid}`, { headers: apiHeaders() });
           if (!resp.ok) throw new Error('查询失败');
           const data = await resp.json();
           if (data.status === 'completed') {
@@ -406,7 +429,7 @@ export default function App() {
   const handleExportWord = async () => {
     if (!taskId) return;
     try {
-      const resp = await fetch(`${API_BASE}/api/export/word/${taskId}`, { method: 'POST' });
+      const resp = await fetch(`${API_BASE}/api/export/word/${taskId}`, { method: 'POST', headers: apiHeaders() });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `导出失败 (${resp.status})`);
@@ -422,7 +445,7 @@ export default function App() {
   const handleExportMp3 = async () => {
     if (!taskId) return;
     try {
-      const resp = await fetch(`${API_BASE}/api/export/mp3/${taskId}`, { method: 'POST' });
+      const resp = await fetch(`${API_BASE}/api/export/mp3/${taskId}`, { method: 'POST', headers: apiHeaders() });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `导出失败 (${resp.status})`);
@@ -592,6 +615,42 @@ export default function App() {
     </>
   );
 
+  if (!userCode) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-black text-white">
+        <div className="w-20 h-20 rounded-2xl bg-white/10 flex items-center justify-center mb-8">
+          <span className="text-2xl font-bold">FX</span>
+        </div>
+        <h1 className="text-2xl font-bold mb-2">FX281 Studio</h1>
+        <p className="text-gray-400 text-sm mb-8">输入你的6位用户代码开始使用</p>
+        <div className="flex items-center gap-3">
+          <input
+            type="text"
+            maxLength={6}
+            value={loginInput}
+            onChange={(e) => setLoginInput(e.target.value.replace(/\D/g, ''))}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
+            placeholder="000000"
+            className="w-40 text-center text-2xl font-mono tracking-[0.5em] bg-white/10 border border-white/20 rounded-xl px-4 py-3 outline-none focus:border-white/50 focus:bg-white/15 transition-all placeholder:text-white/20"
+            autoFocus
+          />
+        </div>
+        {loginInput.length > 0 && loginInput.length < 6 && (
+          <p className="text-gray-500 text-xs mt-3">还需输入 {6 - loginInput.length} 位</p>
+        )}
+        {loginInput.length === 6 && (
+          <button
+            onClick={handleLogin}
+            className="mt-4 bg-white text-black px-8 py-2.5 rounded-full font-medium text-sm hover:bg-gray-200 transition-colors"
+          >
+            进入工作台
+          </button>
+        )}
+        <p className="text-gray-600 text-[10px] mt-12">你的代码是专属标识，历史记录将保存在此代码下</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen bg-gray-50 text-gray-900 font-sans overflow-hidden">
       <audio ref={audioRef} preload="auto" onError={() => {}} />
@@ -604,6 +663,7 @@ export default function App() {
             </button>
           )}
           <span className="font-bold text-sm tracking-tight">FX281 Studio</span>
+          <span className="text-gray-600 text-[10px] font-mono hidden sm:inline">#{userCode}</span>
           {hasData && <span className="text-gray-500 text-[10px] hidden sm:inline">{transcripts.length}段 · {removedTranscripts.length}删 · {formatTime(keptDuration)}</span>}
         </div>
         <div className="flex items-center gap-2 md:gap-3">
@@ -618,6 +678,10 @@ export default function App() {
           <button onClick={() => setShowExport(true)} disabled={!hasData}
             className="flex items-center gap-1.5 bg-white hover:bg-gray-100 text-black px-2.5 md:px-3 py-1 rounded-full transition-colors font-medium text-xs disabled:opacity-30 disabled:cursor-not-allowed">
             <Download className="w-3 h-3" /><span className="hidden sm:inline">导出</span>
+          </button>
+          <button onClick={handleLogout}
+            className="flex items-center gap-1.5 hover:bg-gray-800 text-gray-500 hover:text-white px-2 py-1 rounded-full transition-colors text-xs" title="退出登录">
+            <X className="w-3 h-3" /><span className="hidden sm:inline">退出</span>
           </button>
         </div>
       </header>
