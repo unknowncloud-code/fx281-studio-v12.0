@@ -299,6 +299,8 @@ export default function App() {
     const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
     if (!allowedExtensions.includes(ext)) { return; }
 
+    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+
     const localUrl = URL.createObjectURL(file);
     if (audioRef.current) { audioRef.current.pause(); }
     prevAudioUrlRef.current = localUrl;
@@ -311,7 +313,7 @@ export default function App() {
       speakerNames: {}, editingSpeaker: null,
       activeTab: '编辑模式', isPlaying: false,
       audioDuration: 0, currentTime: 0, activeSegmentId: null,
-      isUploading: true, uploadStep: 1, uploadProgress: '上传音频文件...',
+      isUploading: true, uploadStep: 1, uploadProgress: `上传中 (${fileSizeMB}MB)...`,
       error: null,
     };
     setWorkspaces(prev => [...prev, ws]);
@@ -320,7 +322,14 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const uploadResp = await fetch(`${API_BASE}/api/process-audio`, { method: 'POST', body: formData });
+      const controller = new AbortController();
+      const uploadTimeout = setTimeout(() => controller.abort(), 600000);
+      const uploadResp = await fetch(`${API_BASE}/api/process-audio`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+      clearTimeout(uploadTimeout);
       if (!uploadResp.ok) throw new Error(`上传失败 (${uploadResp.status})`);
       const uploadData = await uploadResp.json();
       const tid = uploadData.task_id;

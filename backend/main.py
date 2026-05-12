@@ -48,6 +48,9 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 from openai import OpenAI
 qwen_client = OpenAI(api_key=DASHSCOPE_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
 
+from openai import AsyncOpenAI
+qwen_async_client = AsyncOpenAI(api_key=DASHSCOPE_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+
 _local_asr_model = None
 
 def _get_local_asr():
@@ -412,7 +415,7 @@ async def _local_transcribe(file_path: str, task_id: str) -> List[dict]:
 # DashScope ASR (fallback)
 # ============================================
 async def _upload_to_dashscope_oss(file_path: str, filename: str) -> str:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=60.0, read=300.0, write=600.0, pool=60.0)) as http_client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=120.0, read=600.0, write=1200.0, pool=120.0)) as http_client:
         policy_resp = await http_client.get(
             "https://dashscope.aliyuncs.com/api/v1/uploads",
             headers={"Authorization": f"Bearer {DASHSCOPE_API_KEY}"},
@@ -446,7 +449,7 @@ async def _upload_to_dashscope_oss(file_path: str, filename: str) -> str:
 
 async def _dashscope_transcribe(file_path: str, filename: str, task_id: str) -> List[dict]:
     oss_url = await _upload_to_dashscope_oss(file_path, filename)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=60.0, read=300.0, write=120.0, pool=60.0)) as http_client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=120.0, read=600.0, write=300.0, pool=120.0)) as http_client:
         submit_resp = await http_client.post(
             "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription",
             headers={
@@ -619,8 +622,7 @@ async def _call_qwen(prompt: str, task_id: str, label: str, retries: int = 3) ->
     for attempt in range(1, retries + 1):
         try:
             resp = await asyncio.wait_for(
-                asyncio.to_thread(
-                    qwen_client.chat.completions.create,
+                qwen_async_client.chat.completions.create(
                     model=QWEN_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                 ),
@@ -628,10 +630,12 @@ async def _call_qwen(prompt: str, task_id: str, label: str, retries: int = 3) ->
             )
             return resp.choices[0].message.content.strip()
         except asyncio.TimeoutError:
+            logger.warning(f"[{task_id}] {label} timeout attempt {attempt}/{retries}")
             if attempt < retries:
                 await asyncio.sleep(5)
         except Exception as e:
             err = str(e).lower()
+            logger.warning(f"[{task_id}] {label} error: {e}")
             if any(k in err for k in ['503', '429', 'overload', 'rate_limit']) and attempt < retries:
                 await asyncio.sleep(10 * attempt)
             else:
@@ -679,34 +683,40 @@ def _normalize_suggestion(val) -> str:
     return "keep"
 
 
+async def _analyze_batch(batch: List[dict], batch_num: int, total: int, task_id: str) -> List[dict]:
+    lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s['speaker']}: {s['text']}" for s in batch]
+    prompt = QWEN_BATCH_PROMPT.format(transcript_text="\n".join(lines))
+    response_text = await _call_qwen(prompt, task_id, f"Batch {batch_num}/{total}")
+    if not response_text:
+        return batch
+    parsed = parse_json_response(response_text)
+    if parsed and isinstance(parsed, dict):
+        bs = parsed.get("segments", [])
+        if bs and isinstance(bs, list):
+            return bs
+    elif parsed and isinstance(parsed, list):
+        return parsed
+    return batch
+
+
 async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
     BATCH_SIZE = 50
-    all_analyzed = []
-
+    batches = []
     for batch_start in range(0, len(segments), BATCH_SIZE):
-        batch = segments[batch_start:batch_start + BATCH_SIZE]
-        batch_num = batch_start // BATCH_SIZE + 1
-        total = (len(segments) + BATCH_SIZE - 1) // BATCH_SIZE
+        batches.append(segments[batch_start:batch_start + BATCH_SIZE])
+    total = len(batches)
 
-        lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s['speaker']}: {s['text']}" for s in batch]
-        prompt = QWEN_BATCH_PROMPT.format(transcript_text="\n".join(lines))
+    tasks_progress = [f"千问文本分析... 批次 {i+1}/{total}" for i in range(total)]
+    logger.info(f"[{task_id}] Starting {total} batch(es) in parallel")
 
-        response_text = await _call_qwen(prompt, task_id, f"Batch {batch_num}/{total}")
-        if not response_text:
-            all_analyzed.extend(batch)
-            continue
+    batch_results = await asyncio.gather(*[
+        _analyze_batch(batches[i], i + 1, total, task_id)
+        for i in range(total)
+    ])
 
-        parsed = parse_json_response(response_text)
-        if parsed and isinstance(parsed, dict):
-            bs = parsed.get("segments", [])
-            if bs and isinstance(bs, list):
-                all_analyzed.extend(bs)
-            else:
-                all_analyzed.extend(batch)
-        elif parsed and isinstance(parsed, list):
-            all_analyzed.extend(parsed)
-        else:
-            all_analyzed.extend(batch)
+    all_analyzed = []
+    for result in batch_results:
+        all_analyzed.extend(result)
 
     result_segments = []
     for i, seg in enumerate(segments):
@@ -1023,8 +1033,11 @@ async def process_audio(file: UploadFile = File(...)):
     tmp = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-            content = await file.read()
-            f.write(content)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
             tmp = f.name
     except Exception as e:
         if tmp and os.path.exists(tmp): os.remove(tmp)
