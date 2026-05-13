@@ -63,7 +63,7 @@ def _get_local_asr():
         _local_asr_model = AutoModel(
             model="iic/SenseVoiceSmall",
             vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            vad_kwargs={"max_single_segment_time": 60000},
+            vad_kwargs={"max_single_segment_time": 30000},
             device="cuda" if _check_cuda() else "cpu",
         )
         logger.info("Local SenseVoice model loaded successfully!")
@@ -356,7 +356,7 @@ async def _local_transcribe(file_path: str, task_id: str) -> List[dict]:
             input=file_path,
             language="zh",
             use_itn=True,
-            batch_size_s=300,
+            batch_size_s=60,
         ),
         timeout=600.0,
     )
