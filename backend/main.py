@@ -555,6 +555,8 @@ async def upload_and_transcribe(file_path: str, filename: str, task_id: str) -> 
     if ASR_MODE == "local":
         try:
             logger.info(f"[{task_id}] Using LOCAL SenseVoice ASR")
+            tasks[task_id]["progress"] = "本地语音转文字... 10%"
+            tasks[task_id]["percent"] = 10
             raw_segments = await _local_transcribe(file_path, task_id)
             if raw_segments:
                 logger.info(f"[{task_id}] Local ASR succeeded: {len(raw_segments)} segments")
@@ -562,14 +564,20 @@ async def upload_and_transcribe(file_path: str, filename: str, task_id: str) -> 
                 raise Exception("Local ASR returned empty results")
         except Exception as e:
             logger.warning(f"[{task_id}] Local ASR failed: {e}, falling back to DashScope...")
+            tasks[task_id]["progress"] = "云端语音转文字... 10%"
+            tasks[task_id]["percent"] = 10
             raw_segments = await _dashscope_transcribe(file_path, filename, task_id)
     else:
         logger.info(f"[{task_id}] Using DashScope ASR")
+        tasks[task_id]["progress"] = "上传音频到云端... 5%"
+        tasks[task_id]["percent"] = 5
         raw_segments = await _dashscope_transcribe(file_path, filename, task_id)
 
     if not raw_segments:
         return []
 
+    tasks[task_id]["progress"] = "合并段落... 25%"
+    tasks[task_id]["percent"] = 25
     merged = merge_segments(raw_segments)
     segments = []
     for i, seg in enumerate(merged):
@@ -683,20 +691,21 @@ def _normalize_suggestion(val) -> str:
     return "keep"
 
 
-async def _analyze_batch(batch: List[dict], batch_num: int, total: int, task_id: str) -> List[dict]:
-    lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s['speaker']}: {s['text']}" for s in batch]
-    prompt = QWEN_BATCH_PROMPT.format(transcript_text="\n".join(lines))
-    response_text = await _call_qwen(prompt, task_id, f"Batch {batch_num}/{total}")
-    if not response_text:
+async def _analyze_batch(batch: List[dict], batch_num: int, total: int, task_id: str, sem: asyncio.Semaphore) -> List[dict]:
+    async with sem:
+        lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s['speaker']}: {s['text']}" for s in batch]
+        prompt = QWEN_BATCH_PROMPT.format(transcript_text="\n".join(lines))
+        response_text = await _call_qwen(prompt, task_id, f"Batch {batch_num}/{total}")
+        if not response_text:
+            return batch
+        parsed = parse_json_response(response_text)
+        if parsed and isinstance(parsed, dict):
+            bs = parsed.get("segments", [])
+            if bs and isinstance(bs, list):
+                return bs
+        elif parsed and isinstance(parsed, list):
+            return parsed
         return batch
-    parsed = parse_json_response(response_text)
-    if parsed and isinstance(parsed, dict):
-        bs = parsed.get("segments", [])
-        if bs and isinstance(bs, list):
-            return bs
-    elif parsed and isinstance(parsed, list):
-        return parsed
-    return batch
 
 
 async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
@@ -706,13 +715,21 @@ async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
         batches.append(segments[batch_start:batch_start + BATCH_SIZE])
     total = len(batches)
 
-    tasks_progress = [f"千问文本分析... 批次 {i+1}/{total}" for i in range(total)]
-    logger.info(f"[{task_id}] Starting {total} batch(es) in parallel")
+    sem = asyncio.Semaphore(3)
+    completed_count = 0
 
-    batch_results = await asyncio.gather(*[
-        _analyze_batch(batches[i], i + 1, total, task_id)
-        for i in range(total)
-    ])
+    async def _run_batch(idx: int) -> List[dict]:
+        nonlocal completed_count
+        result = await _analyze_batch(batches[idx], idx + 1, total, task_id, sem)
+        completed_count += 1
+        pct = 30 + int(completed_count / total * 50)
+        tasks[task_id]["progress"] = f"千问文本分析... 批次 {completed_count}/{total} ({pct}%)"
+        tasks[task_id]["percent"] = pct
+        return result
+
+    logger.info(f"[{task_id}] Starting {total} batch(es) with concurrency=3")
+
+    batch_results = await asyncio.gather(*[_run_batch(i) for i in range(total)])
 
     all_analyzed = []
     for result in batch_results:
@@ -748,6 +765,8 @@ async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
 
     speakers = _extract_speakers(result_segments)
 
+    tasks[task_id]["progress"] = "生成章节导览... 85%"
+    tasks[task_id]["percent"] = 85
     valid_chapters = await _generate_chapters(result_segments, task_id)
     if not valid_chapters:
         valid_chapters = _auto_chapter(result_segments)
@@ -812,16 +831,19 @@ async def _generate_chapters(segments: List[dict], task_id: str) -> List[dict]:
 async def _process_audio_task(task_id: str, file_path: str, filename: str):
     try:
         tasks[task_id]["status"] = "transcribing"
-        asr_label = "本地语音转文字" if ASR_MODE == "local" else "千问语音转文字"
-        tasks[task_id]["progress"] = asr_label + "..."
+        asr_label = "本地语音转文字" if ASR_MODE == "local" else "云端语音转文字"
+        tasks[task_id]["progress"] = f"{asr_label}... 0%"
+        tasks[task_id]["percent"] = 0
         segments = await upload_and_transcribe(file_path, filename, task_id)
         if not segments:
             raise Exception("语音转文字返回空结果，音频可能为静音或已损坏")
         tasks[task_id]["status"] = "analyzing"
-        tasks[task_id]["progress"] = f"千问文本分析... (共 {len(segments)} 段)"
+        tasks[task_id]["progress"] = f"千问文本分析... 0%"
+        tasks[task_id]["percent"] = 30
         analysis = await analyze_with_qwen(segments, task_id)
         tasks[task_id]["status"] = "completed"
-        tasks[task_id]["progress"] = "完成!"
+        tasks[task_id]["progress"] = "完成! 100%"
+        tasks[task_id]["percent"] = 100
         tasks[task_id]["segments"] = analysis["segments"]
         tasks[task_id]["speakers"] = analysis["speakers"]
         tasks[task_id]["chapters"] = analysis["chapters"]
@@ -834,6 +856,7 @@ async def _process_audio_task(task_id: str, file_path: str, filename: str):
         tasks[task_id]["status"] = "failed"
         tasks[task_id]["error"] = err_msg
         tasks[task_id]["progress"] = f"处理失败: {err_msg}"
+        tasks[task_id]["percent"] = 0
 
 
 # ============================================
@@ -1095,7 +1118,7 @@ async def get_task_status(task_id: str):
     resp = {
         "task_id": task_id, "status": task["status"],
         "progress": task["progress"], "message": task.get("message"),
-        "error": task.get("error"),
+        "error": task.get("error"), "percent": task.get("percent", 0),
     }
     if task["status"] == "completed":
         resp["segments"] = task.get("segments", [])

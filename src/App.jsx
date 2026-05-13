@@ -335,7 +335,7 @@ export default function App() {
       speakerNames: {}, editingSpeaker: null,
       activeTab: '编辑模式', isPlaying: false,
       audioDuration: 0, currentTime: 0, activeSegmentId: null,
-      isUploading: true, uploadStep: 1, uploadProgress: `上传中 (${fileSizeMB}MB)...`,
+      isUploading: true, uploadStep: 1, uploadProgress: `上传中 (${fileSizeMB}MB)...`, uploadPercent: 5,
       error: null,
     };
     setWorkspaces(prev => [...prev, ws]);
@@ -374,7 +374,7 @@ export default function App() {
             (data.speakers || []).forEach(s => { names[s.id] = s.name || s.id.replace(/_/g, ' '); });
             updateWs(wsId, {
               transcripts: data.segments || [], speakers: data.speakers || [], chapters: data.chapters || [],
-              speakerNames: names, isUploading: false, uploadStep: 4, uploadProgress: '完成!',
+              speakerNames: names, isUploading: false, uploadStep: 4, uploadProgress: '完成!', uploadPercent: 100,
             });
             setTimeout(() => updateWs(wsId, { uploadStep: 0, uploadProgress: '' }), 1500);
             break;
@@ -384,8 +384,8 @@ export default function App() {
             updateWs(wsId, { error: `处理失败: ${errMsg}`, isUploading: false });
             break;
           }
-          if (data.status === 'transcribing') updateWs(wsId, { uploadStep: 2, uploadProgress: '本地语音转文字...' });
-          else if (data.status === 'analyzing') updateWs(wsId, { uploadStep: 3, uploadProgress: data.progress || '千问文本分析...' });
+          if (data.status === 'transcribing') updateWs(wsId, { uploadStep: 2, uploadProgress: data.progress || '语音转文字...', uploadPercent: data.percent || 10 });
+          else if (data.status === 'analyzing') updateWs(wsId, { uploadStep: 3, uploadProgress: data.progress || '千问文本分析...', uploadPercent: data.percent || 30 });
         } catch (err) {
           console.warn('[Poll] Error:', err.message);
           await new Promise(r => setTimeout(r, pollInterval));
@@ -868,17 +868,22 @@ export default function App() {
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-8 max-w-xs w-full mx-4 shadow-2xl">
             <div className="flex flex-col items-center text-center">
-              <div className="w-12 h-12 mb-6 relative">
-                <div className="absolute inset-0 border-4 border-gray-200 rounded-full"></div>
-                <div className="absolute inset-0 border-4 border-black rounded-full border-t-transparent animate-spin"></div>
+              <div className="w-16 h-16 mb-4 relative">
+                <svg className="w-16 h-16 -rotate-90" viewBox="0 0 64 64">
+                  <circle cx="32" cy="32" r="28" fill="none" stroke="#e5e7eb" strokeWidth="4" />
+                  <circle cx="32" cy="32" r="28" fill="none" stroke="#111" strokeWidth="4"
+                    strokeDasharray={`${(activeWs?.uploadPercent || 0) / 100 * 175.9} 175.9`}
+                    strokeLinecap="round" className="transition-all duration-700" />
+                </svg>
+                <span className="absolute inset-0 flex items-center justify-center text-sm font-bold">{activeWs?.uploadPercent || 0}%</span>
               </div>
               <h3 className="text-base font-semibold text-gray-900 mb-1">AI 正在处理</h3>
               <p className="text-gray-500 text-[10px] mb-4">{uploadProgress || '准备中...'}</p>
               <div className="w-full h-0.5 bg-gray-200 rounded-full overflow-hidden mb-4">
-                <div className="h-full bg-gray-900 rounded-full transition-all duration-1000" style={{ width: `${uploadStep * 25}%` }}></div>
+                <div className="h-full bg-gray-900 rounded-full transition-all duration-700" style={{ width: `${activeWs?.uploadPercent || 0}%` }}></div>
               </div>
               <div className="w-full space-y-1.5">
-                {[{ step: 1, label: '上传音频文件' }, { step: 2, label: '本地语音转文字' }, { step: 3, label: '千问文本分析' }, { step: 4, label: '生成剪辑建议' }].map(s => (
+                {[{ step: 1, label: '上传音频文件' }, { step: 2, label: '语音转文字' }, { step: 3, label: '千问文本分析' }, { step: 4, label: '生成剪辑建议' }].map(s => (
                   <div key={s.step} className="flex items-center gap-1.5">
                     <div className={`w-3.5 h-3.5 rounded-full flex items-center justify-center ${uploadStep >= s.step ? 'bg-gray-900' : 'bg-gray-200'}`}>
                       <span className={`text-[8px] ${uploadStep >= s.step ? 'text-white' : 'text-gray-400'}`}>{s.step}</span>
