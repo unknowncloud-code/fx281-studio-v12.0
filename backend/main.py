@@ -63,8 +63,9 @@ def _get_local_asr():
         _local_asr_model = AutoModel(
             model="iic/SenseVoiceSmall",
             vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            vad_kwargs={"max_single_segment_time": 30000},
+            vad_kwargs={"max_single_segment_time": 60000},
             device="cuda" if _check_cuda() else "cpu",
+            disable_update=True,
         )
         logger.info("Local SenseVoice model loaded successfully!")
         return _local_asr_model
@@ -1089,7 +1090,7 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
 
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
-        "status": "uploaded", "progress": "文件已上传...",
+        "status": "uploaded", "progress": "文件已上传...", "percent": 0,
         "segments": None, "speakers": None, "chapters": None,
         "error": None, "message": None, "filename": file.filename,
         "original_file": tmp,
