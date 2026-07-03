@@ -1,5 +1,6 @@
 # ============================================
 # FX281 Podcast Backend - Python Dependencies (Cloud)
+# 部署用轻量依赖：不含 torch/funasr/modelscope，用 DashScope 云端 ASR
 # Python 3.11 required (see runtime.txt)
 # ============================================
 
@@ -8,13 +9,13 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 
-# DashScope SDK
+# DashScope SDK（云端 ASR 调用用 httpx，dashscope SDK 备用）
 dashscope
 
-# Qwen Chat (OpenAI-compatible mode)
+# DeepSeek / Qwen Chat (OpenAI-compatible mode)
 openai
 
-# HTTP client
+# HTTP client（DashScope OSS 上传 + 转写轮询）
 httpx
 
 # Data
@@ -23,6 +24,9 @@ pydantic==2.9.2
 # Export
 python-docx
 pydub
+
+# ffmpeg 兜底（容器内若无系统 ffmpeg）
+imageio-ffmpeg
 
 # ============================================
 # Install

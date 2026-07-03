@@ -1,23 +1,25 @@
 @echo off
 echo ======================================
-echo FX281 后端启动脚本 (CUDA GPU加速)
+echo FX281 Studio - Backend Launcher
 echo ======================================
 echo.
 cd /d "%~dp0"
 
 if not exist "venv\Scripts\python.exe" (
-    echo 正在创建虚拟环境...
+    echo [1/3] Creating virtual environment...
     python -m venv venv
-    echo 正在安装CUDA版PyTorch...
+    echo [2/3] Installing CUDA PyTorch...
     venv\Scripts\pip.exe install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-    echo 正在安装其他依赖...
-    venv\Scripts\pip.exe install fastapi uvicorn python-multipart dashscope openai httpx pydantic funasr modelscope python-docx pydub numpy
+    echo [3/3] Installing dependencies...
+    venv\Scripts\pip.exe install fastapi uvicorn python-multipart openai httpx pydantic funasr modelscope python-docx pydub numpy
 )
 
 echo.
-echo 启动后端服务器 (GPU模式)...
-echo 访问地址: http://localhost:8000
-echo API 文档: http://localhost:8000/docs
+echo Starting backend server...
+echo Backend:  http://localhost:8000
+echo API Docs: http://localhost:8000/docs
+echo.
+echo Frontend: http://localhost:5173 (run "npm run dev" in project root)
 echo.
 venv\Scripts\python.exe main.py
 pause

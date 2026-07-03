@@ -1,13 +1,13 @@
 services:
   - type: web
-    name: fx281-studio-v12-backend
+    name: fx281-studio
     runtime: python
-    buildCommand: pip install -r backend/requirements-cloud.txt
+    buildCommand: npm install && npm run build && pip install -r backend/requirements-cloud.txt
     startCommand: cd backend && python main.py
     envVars:
-      - key: DASHSCOPE_API_KEY
-        sync: false
       - key: ASR_MODE
         value: dashscope
-      - key: PORT
-        value: 8000
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false

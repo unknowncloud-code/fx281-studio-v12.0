@@ -1,5 +1,5 @@
 # ============================================
-# FX281 Podcast Backend - Python Dependencies
+# FX281 Studio - Backend Python Dependencies
 # ============================================
 
 # Web Framework
@@ -7,10 +7,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 
-# DashScope SDK (SenseVoice STT + file upload)
-dashscope
-
-# Qwen Chat (OpenAI-compatible mode)
+# DeepSeek Chat (OpenAI-compatible mode)
 openai
 
 # HTTP client
@@ -19,15 +16,24 @@ httpx
 # Data
 pydantic==2.9.2
 
-# Local ASR (FunASR + SenseVoice)
+# Local ASR (FunASR + SenseVoice + VAD)
 funasr
 modelscope
 
 # Export
 python-docx
 pydub
+imageio-ffmpeg
 
 # ============================================
-# Install
+# Install (macOS — Apple Silicon arm64)
 # ============================================
-# pip install -r requirements.txt
+# 1. Create venv:     python3 -m venv venv
+# 2. Activate:        source venv/bin/activate
+# 3. Install PyTorch (MPS-accelerated on Apple Silicon, from default PyPI):
+#    pip install torch==2.6.0 torchaudio==2.6.0
+# 4. Install rest:    pip install -r requirements.txt
+#
+# NOTE: macOS has no CUDA. The default PyPI torch wheel enables MPS
+#       (Metal) acceleration on Apple Silicon automatically.
+#       Windows/CUDA setup (legacy): torch==2.6.0 --index-url .../whl/cu124

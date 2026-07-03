@@ -4,17 +4,8 @@ import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 
 const SPEAKER_COLORS = ['#1a1a1a', '#4a4a4a', '#7a7a7a', '#aaa', '#333', '#666'];
 
-const CLOUD_BACKEND = 'https://fx281-studio-v12-0-backend.onrender.com';
-const getApiBase = () => {
-  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-    return CLOUD_BACKEND;
-  }
-  return '';
-};
-const API_BASE = typeof window !== 'undefined' ? getApiBase() : '';
-
 const REASON_LABELS = {
-  filler: '口癖', echo: '附和', noise: '杂音', redundant: '冗余',
+  filler: '口癖', echo: '附和', noise: '杂音', redundant: '冗余', off_topic: '离题', stutter: '结巴', sensitive: '敏感',
 };
 
 const REASON_COLORS = {
@@ -22,6 +13,9 @@ const REASON_COLORS = {
   echo: 'bg-purple-50 text-purple-600 border-purple-200',
   noise: 'bg-red-50 text-red-600 border-red-200',
   redundant: 'bg-blue-50 text-blue-600 border-blue-200',
+  off_topic: 'bg-orange-50 text-orange-600 border-orange-200',
+  stutter: 'bg-teal-50 text-teal-600 border-teal-200',
+  sensitive: 'bg-rose-50 text-rose-600 border-rose-200',
 };
 
 const SUGGESTION_LABELS = {
@@ -38,8 +32,6 @@ function formatTime(seconds) {
 }
 
 export default function App() {
-  const [userCode, setUserCode] = useState(() => localStorage.getItem('fx281_user_code') || '');
-  const [loginInput, setLoginInput] = useState('');
   const [workspaces, setWorkspaces] = useState([]);
   const [activeWsId, setActiveWsId] = useState(null);
   const [showExport, setShowExport] = useState(false);
@@ -49,10 +41,11 @@ export default function App() {
 
   const audioRef = useRef(null);
   const progressRef = useRef(null);
-  const prevAudioUrlRef = useRef(null);
   const segmentRefs = useRef({});
   const previewTimeoutRef = useRef(null);
   const draggingRef = useRef(false);
+  const uploadingRef = useRef(false);
+  const abortRef = useRef(null);
 
   const activeWs = workspaces.find(w => w.id === activeWsId) || null;
 
@@ -60,42 +53,26 @@ export default function App() {
     setWorkspaces(prev => prev.map(w => w.id === id ? { ...w, ...updates } : w));
   }, []);
 
-  const apiHeaders = useCallback(() => ({
-    'X-User-Code': userCode,
-  }), [userCode]);
-
-  const handleLogin = () => {
-    const code = loginInput.trim();
-    if (code.length === 6 && /^\d{6}$/.test(code)) {
-      setUserCode(code);
-      localStorage.setItem('fx281_user_code', code);
-      setLoginInput('');
-    }
-  };
-
-  const handleLogout = () => {
-    setUserCode('');
-    localStorage.removeItem('fx281_user_code');
-    setWorkspaces([]);
-    setActiveWsId(null);
-  };
-
-  const transcripts = activeWs?.transcripts || [];
+  const transcripts = useMemo(() => activeWs?.transcripts || [], [activeWs?.transcripts]);
   const speakers = activeWs?.speakers || [];
-  const chapters = activeWs?.chapters || [];
+  const chapters = useMemo(() => activeWs?.chapters || [], [activeWs?.chapters]);
   const speakerNames = activeWs?.speakerNames || {};
   const editingSpeaker = activeWs?.editingSpeaker || null;
   const activeTab = activeWs?.activeTab || '编辑模式';
   const isPlaying = activeWs?.isPlaying || false;
   const audioDuration = activeWs?.audioDuration || 0;
   const currentTime = activeWs?.currentTime || 0;
-  const activeSegmentId = activeWs?.activeSegmentId || null;
+  const activeSegmentId = useMemo(() => {
+    const active = transcripts.find(t => currentTime >= (t.startTime || 0) && currentTime < (t.endTime || 0));
+    return active?.id ?? null;
+  }, [currentTime, transcripts]);
   const isUploading = activeWs?.isUploading || false;
   const uploadStep = activeWs?.uploadStep || 0;
   const uploadProgress = activeWs?.uploadProgress || '';
   const error = activeWs?.error || null;
   const audioUrl = activeWs?.audioUrl || null;
   const taskId = activeWs?.taskId || null;
+  const summary = activeWs?.summary || '';
   const hasData = transcripts.length > 0;
 
   const displayedTranscripts = activeTab === '粗剪预览' ? transcripts.filter(t => t.isKept) : transcripts;
@@ -160,21 +137,18 @@ export default function App() {
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
+    const prevSrc = audio.src;
     audio.pause();
+    audio.removeAttribute('src');
     if (audioUrl) {
       audio.src = audioUrl;
-      audio.load();
-    } else {
-      audio.removeAttribute('src');
-      audio.load();
     }
+    audio.load();
+    if (prevSrc && prevSrc.startsWith('blob:') && prevSrc !== audioUrl) {
+      URL.revokeObjectURL(prevSrc);
+    }
+    return () => { audio.pause(); };
   }, [audioUrl]);
-
-  useEffect(() => {
-    if (transcripts.length === 0 || !activeWsId) return;
-    const active = transcripts.find(t => currentTime >= (t.startTime || 0) && currentTime < (t.endTime || 0));
-    updateWs(activeWsId, { activeSegmentId: active ? active.id : null });
-  }, [currentTime, transcripts, activeWsId, updateWs]);
 
   const toggleKeep = (id) => {
     if (!activeWsId) return;
@@ -218,6 +192,12 @@ export default function App() {
     audio.addEventListener('timeupdate', onTimeUpdate);
     return () => audio.removeEventListener('timeupdate', onTimeUpdate);
   }, [isPlaying, activeTab, transcripts, audioUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) { abortRef.current.abort(); }
+    };
+  }, []);
 
   const togglePlayPause = () => {
     const audio = audioRef.current;
@@ -267,7 +247,7 @@ export default function App() {
 
   const loadHistory = async () => {
     try {
-      const resp = await fetch(`${API_BASE}/api/history`, { headers: apiHeaders() });
+      const resp = await fetch('/api/history');
       if (resp.ok) {
         const data = await resp.json();
         setHistoryList(data);
@@ -280,16 +260,17 @@ export default function App() {
 
   const loadHistoryDetail = async (tid) => {
     try {
-      const resp = await fetch(`${API_BASE}/api/history/${tid}`, { headers: apiHeaders() });
+      const resp = await fetch(`/api/history/${tid}`);
       if (!resp.ok) throw new Error('加载失败');
       const data = await resp.json();
       const names = {};
       (data.speakers || []).forEach(s => { names[s.id] = s.name || s.id.replace(/_/g, ' '); });
-      const wsId = Date.now().toString();
+      const wsId = crypto.randomUUID();
       const ws = {
         id: wsId, filename: data.filename || '历史记录', taskId: tid,
         audioUrl: null,
         transcripts: data.segments || [], speakers: data.speakers || [], chapters: data.chapters || [],
+        summary: data.summary || '',
         speakerNames: names, editingSpeaker: null,
         activeTab: '编辑模式', isPlaying: false,
         audioDuration: 0, currentTime: 0, activeSegmentId: null,
@@ -306,7 +287,7 @@ export default function App() {
 
   const deleteHistory = async (tid) => {
     try {
-      const resp = await fetch(`${API_BASE}/api/history/${tid}`, { method: 'DELETE', headers: apiHeaders() });
+      const resp = await fetch(`/api/history/${tid}`, { method: 'DELETE' });
       if (!resp.ok) throw new Error('删除失败');
       setHistoryList(prev => prev.filter(h => h.task_id !== tid));
     } catch (e) {
@@ -320,12 +301,11 @@ export default function App() {
     const allowedExtensions = ['.mp3', '.m4a', '.wav', '.flac'];
     const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
     if (!allowedExtensions.includes(ext)) { return; }
-
-    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    if (uploadingRef.current) { event.target.value = ''; return; }
+    uploadingRef.current = true;
 
     const localUrl = URL.createObjectURL(file);
     if (audioRef.current) { audioRef.current.pause(); }
-    prevAudioUrlRef.current = localUrl;
 
     const wsId = Date.now().toString();
     const ws = {
@@ -335,24 +315,18 @@ export default function App() {
       speakerNames: {}, editingSpeaker: null,
       activeTab: '编辑模式', isPlaying: false,
       audioDuration: 0, currentTime: 0, activeSegmentId: null,
-      isUploading: true, uploadStep: 1, uploadProgress: `上传中 (${fileSizeMB}MB)...`, uploadPercent: 5,
+      isUploading: true, uploadStep: 1, uploadProgress: '上传音频文件...',
       error: null,
     };
     setWorkspaces(prev => [...prev, ws]);
     setActiveWsId(wsId);
 
     try {
+      const controller = new AbortController();
+      abortRef.current = controller;
       const formData = new FormData();
       formData.append('file', file);
-      const controller = new AbortController();
-      const uploadTimeout = setTimeout(() => controller.abort(), 600000);
-      const uploadResp = await fetch(`${API_BASE}/api/process-audio`, {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-        headers: apiHeaders(),
-      });
-      clearTimeout(uploadTimeout);
+      const uploadResp = await fetch('/api/process-audio', { method: 'POST', body: formData, signal: controller.signal });
       if (!uploadResp.ok) throw new Error(`上传失败 (${uploadResp.status})`);
       const uploadData = await uploadResp.json();
       const tid = uploadData.task_id;
@@ -360,48 +334,70 @@ export default function App() {
 
       updateWs(wsId, { taskId: tid, uploadStep: 2, uploadProgress: '本地语音转文字...' });
 
-      const pollInterval = 3000;
-      const maxTime = 3600000;
+      const pollInterval = 2000;
+      const maxTime = 7200000;
       const startTime = Date.now();
+      let consecutiveErrors = 0;
+      const MAX_CONSECUTIVE_ERRORS = 5;
 
       while (Date.now() - startTime < maxTime) {
         try {
-          const resp = await fetch(`${API_BASE}/api/task/${tid}`, { headers: apiHeaders() });
-          if (!resp.ok) throw new Error('查询失败');
+          const resp = await fetch(`/api/task/${tid}`);
+          if (!resp.ok) throw new Error(`查询失败 (${resp.status})`);
           const data = await resp.json();
+          consecutiveErrors = 0;
           if (data.status === 'completed') {
             const names = {};
             (data.speakers || []).forEach(s => { names[s.id] = s.name || s.id.replace(/_/g, ' '); });
             updateWs(wsId, {
               transcripts: data.segments || [], speakers: data.speakers || [], chapters: data.chapters || [],
-              speakerNames: names, isUploading: false, uploadStep: 4, uploadProgress: '完成!', uploadPercent: 100,
+              summary: data.summary || '',
+              speakerNames: names, isUploading: false, uploadStep: 4, uploadProgress: '完成!',
             });
             setTimeout(() => updateWs(wsId, { uploadStep: 0, uploadProgress: '' }), 1500);
-            break;
+            return;
           }
           if (data.status === 'failed') {
             const errMsg = data.error || '处理失败';
             updateWs(wsId, { error: `处理失败: ${errMsg}`, isUploading: false });
-            break;
+            return;
           }
-          if (data.status === 'transcribing') updateWs(wsId, { uploadStep: 2, uploadProgress: data.progress || '语音转文字...', uploadPercent: data.percent || 10 });
-          else if (data.status === 'analyzing') updateWs(wsId, { uploadStep: 3, uploadProgress: data.progress || '千问文本分析...', uploadPercent: data.percent || 30 });
+          if (data.status === 'transcribing') updateWs(wsId, { uploadStep: 2, uploadProgress: '本地语音转文字...' });
+          else if (data.status === 'analyzing') updateWs(wsId, { uploadStep: 3, uploadProgress: data.progress || 'DeepSeek 文本分析...' });
         } catch (err) {
-          console.warn('[Poll] Error:', err.message);
+          consecutiveErrors++;
+          console.warn(`[Poll] Error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, err.message);
+          if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+            updateWs(wsId, { error: '服务连接失败，请检查后端是否运行', isUploading: false });
+            return;
+          }
           await new Promise(r => setTimeout(r, pollInterval));
         }
         await new Promise(r => setTimeout(r, pollInterval));
       }
+      updateWs(wsId, { error: '处理超时，请重试', isUploading: false });
     } catch (err) {
-      updateWs(wsId, { error: `处理失败: ${err.message}`, isUploading: false });
+      if (err.name !== 'AbortError') {
+        updateWs(wsId, { error: `处理失败: ${err.message}`, isUploading: false });
+      }
+    } finally {
+      uploadingRef.current = false;
+      abortRef.current = null;
     }
     event.target.value = '';
   };
 
   const removeWorkspace = (id) => {
-    setWorkspaces(prev => prev.filter(w => w.id !== id));
+    if (abortRef.current) { abortRef.current.abort(); }
+    setWorkspaces(prev => {
+      const target = prev.find(w => w.id === id);
+      if (target?.audioUrl?.startsWith('blob:')) {
+        URL.revokeObjectURL(target.audioUrl);
+      }
+      return prev.filter(w => w.id !== id);
+    });
     if (activeWsId === id) {
-      setActiveWsId(prev => {
+      setActiveWsId(() => {
         const remaining = workspaces.filter(w => w.id !== id);
         return remaining.length > 0 ? remaining[0].id : null;
       });
@@ -426,10 +422,26 @@ export default function App() {
     updateWs(activeWsId, { speakerNames: { ...speakerNames, [id]: newName }, editingSpeaker: null });
   };
 
+  const syncHumanDecisions = async () => {
+    if (!taskId) return;
+    const resp = await fetch(`/api/task/${taskId}/decisions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        decisions: transcripts.map(segment => ({ id: segment.id, isKept: Boolean(segment.isKept) })),
+      }),
+    });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.detail || `同步人工决策失败 (${resp.status})`);
+    }
+  };
+
   const handleExportWord = async () => {
     if (!taskId) return;
     try {
-      const resp = await fetch(`${API_BASE}/api/export/word/${taskId}`, { method: 'POST', headers: apiHeaders() });
+      await syncHumanDecisions();
+      const resp = await fetch(`/api/export/word/${taskId}`, { method: 'POST' });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `导出失败 (${resp.status})`);
@@ -445,7 +457,8 @@ export default function App() {
   const handleExportMp3 = async () => {
     if (!taskId) return;
     try {
-      const resp = await fetch(`${API_BASE}/api/export/mp3/${taskId}`, { method: 'POST', headers: apiHeaders() });
+      await syncHumanDecisions();
+      const resp = await fetch(`/api/export/mp3/${taskId}`, { method: 'POST' });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}));
         throw new Error(errData.detail || `导出失败 (${resp.status})`);
@@ -500,8 +513,6 @@ export default function App() {
     return '';
   };
 
-  let lastChapterTitle = null;
-
   const renderSidebar = (isMobile) => (
     <>
       <div className="p-5 pb-3">
@@ -515,7 +526,7 @@ export default function App() {
       </div>
       <hr className="border-gray-100 mx-5" />
 
-      {hasData && (mildTranscripts.length > 0 || strongTranscripts.length > 0) && (
+      {hasData && (
         <>
           <div className="p-5 pb-3">
             <p className="text-[10px] font-medium text-gray-400 uppercase tracking-widest mb-2">AI 建议</p>
@@ -539,6 +550,13 @@ export default function App() {
           </div>
           <hr className="border-gray-100 mx-5" />
         </>
+      )}
+
+      {summary && (
+        <div className="px-5 pt-4 pb-2">
+          <p className="text-[10px] font-medium text-gray-400 uppercase tracking-widest mb-2">录音概述</p>
+          <p className="text-[11px] text-gray-600 leading-relaxed">{summary}</p>
+        </div>
       )}
 
       <div className="p-5 pb-3">
@@ -615,42 +633,6 @@ export default function App() {
     </>
   );
 
-  if (!userCode) {
-    return (
-      <div className="flex flex-col items-center justify-center h-screen bg-black text-white">
-        <div className="w-20 h-20 rounded-2xl bg-white/10 flex items-center justify-center mb-8">
-          <span className="text-2xl font-bold">FX</span>
-        </div>
-        <h1 className="text-2xl font-bold mb-2">FX281 Studio</h1>
-        <p className="text-gray-400 text-sm mb-8">输入你的6位用户代码开始使用</p>
-        <div className="flex items-center gap-3">
-          <input
-            type="text"
-            maxLength={6}
-            value={loginInput}
-            onChange={(e) => setLoginInput(e.target.value.replace(/\D/g, ''))}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
-            placeholder="000000"
-            className="w-40 text-center text-2xl font-mono tracking-[0.5em] bg-white/10 border border-white/20 rounded-xl px-4 py-3 outline-none focus:border-white/50 focus:bg-white/15 transition-all placeholder:text-white/20"
-            autoFocus
-          />
-        </div>
-        {loginInput.length > 0 && loginInput.length < 6 && (
-          <p className="text-gray-500 text-xs mt-3">还需输入 {6 - loginInput.length} 位</p>
-        )}
-        {loginInput.length === 6 && (
-          <button
-            onClick={handleLogin}
-            className="mt-4 bg-white text-black px-8 py-2.5 rounded-full font-medium text-sm hover:bg-gray-200 transition-colors"
-          >
-            进入工作台
-          </button>
-        )}
-        <p className="text-gray-600 text-[10px] mt-12">你的代码是专属标识，历史记录将保存在此代码下</p>
-      </div>
-    );
-  }
-
   return (
     <div className="flex flex-col h-screen bg-gray-50 text-gray-900 font-sans overflow-hidden">
       <audio ref={audioRef} preload="auto" onError={() => {}} />
@@ -663,7 +645,6 @@ export default function App() {
             </button>
           )}
           <span className="font-bold text-sm tracking-tight">FX281 Studio</span>
-          <span className="text-gray-600 text-[10px] font-mono hidden sm:inline">#{userCode}</span>
           {hasData && <span className="text-gray-500 text-[10px] hidden sm:inline">{transcripts.length}段 · {removedTranscripts.length}删 · {formatTime(keptDuration)}</span>}
         </div>
         <div className="flex items-center gap-2 md:gap-3">
@@ -678,10 +659,6 @@ export default function App() {
           <button onClick={() => setShowExport(true)} disabled={!hasData}
             className="flex items-center gap-1.5 bg-white hover:bg-gray-100 text-black px-2.5 md:px-3 py-1 rounded-full transition-colors font-medium text-xs disabled:opacity-30 disabled:cursor-not-allowed">
             <Download className="w-3 h-3" /><span className="hidden sm:inline">导出</span>
-          </button>
-          <button onClick={handleLogout}
-            className="flex items-center gap-1.5 hover:bg-gray-800 text-gray-500 hover:text-white px-2 py-1 rounded-full transition-colors text-xs" title="退出登录">
-            <X className="w-3 h-3" /><span className="hidden sm:inline">退出</span>
           </button>
         </div>
       </header>
@@ -763,10 +740,10 @@ export default function App() {
 
               {hasData && (
                 <div className="max-w-3xl flex flex-col gap-0.5">
-                  {displayedTranscripts.map((item) => {
+                  {displayedTranscripts.map((item, index) => {
                     const chapter = getChapterForSegment(item);
-                    const showChapterDivider = chapter && chapter.title !== lastChapterTitle;
-                    if (showChapterDivider) lastChapterTitle = chapter.title;
+                    const previousChapter = index > 0 ? getChapterForSegment(displayedTranscripts[index - 1]) : null;
+                    const showChapterDivider = chapter && chapter.title !== previousChapter?.title;
                     const suggestion = item.suggestion || 'keep';
 
                     return (
@@ -868,22 +845,17 @@ export default function App() {
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-8 max-w-xs w-full mx-4 shadow-2xl">
             <div className="flex flex-col items-center text-center">
-              <div className="w-16 h-16 mb-4 relative">
-                <svg className="w-16 h-16 -rotate-90" viewBox="0 0 64 64">
-                  <circle cx="32" cy="32" r="28" fill="none" stroke="#e5e7eb" strokeWidth="4" />
-                  <circle cx="32" cy="32" r="28" fill="none" stroke="#111" strokeWidth="4"
-                    strokeDasharray={`${(activeWs?.uploadPercent || 0) / 100 * 175.9} 175.9`}
-                    strokeLinecap="round" className="transition-all duration-700" />
-                </svg>
-                <span className="absolute inset-0 flex items-center justify-center text-sm font-bold">{activeWs?.uploadPercent || 0}%</span>
+              <div className="w-12 h-12 mb-6 relative">
+                <div className="absolute inset-0 border-4 border-gray-200 rounded-full"></div>
+                <div className="absolute inset-0 border-4 border-black rounded-full border-t-transparent animate-spin"></div>
               </div>
               <h3 className="text-base font-semibold text-gray-900 mb-1">AI 正在处理</h3>
               <p className="text-gray-500 text-[10px] mb-4">{uploadProgress || '准备中...'}</p>
               <div className="w-full h-0.5 bg-gray-200 rounded-full overflow-hidden mb-4">
-                <div className="h-full bg-gray-900 rounded-full transition-all duration-700" style={{ width: `${activeWs?.uploadPercent || 0}%` }}></div>
+                <div className="h-full bg-gray-900 rounded-full transition-all duration-1000" style={{ width: `${uploadStep * 25}%` }}></div>
               </div>
               <div className="w-full space-y-1.5">
-                {[{ step: 1, label: '上传音频文件' }, { step: 2, label: '语音转文字' }, { step: 3, label: '千问文本分析' }, { step: 4, label: '生成剪辑建议' }].map(s => (
+                {[{ step: 1, label: '上传音频文件' }, { step: 2, label: '本地语音转文字' }, { step: 3, label: 'DeepSeek 文本分析' }, { step: 4, label: '生成剪辑建议' }].map(s => (
                   <div key={s.step} className="flex items-center gap-1.5">
                     <div className={`w-3.5 h-3.5 rounded-full flex items-center justify-center ${uploadStep >= s.step ? 'bg-gray-900' : 'bg-gray-200'}`}>
                       <span className={`text-[8px] ${uploadStep >= s.step ? 'text-white' : 'text-gray-400'}`}>{s.step}</span>

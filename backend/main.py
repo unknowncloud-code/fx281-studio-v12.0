@@ -1,6 +1,6 @@
 """
-FX281 Podcast Processing Backend v12.0
-- Local FunASR (SenseVoice) STT + Qwen analysis + Word/MP3 export
+FX281 Podcast Processing Backend v13.0
+- Local FunASR (SenseVoice) STT + DeepSeek analysis + Word/MP3 export
 - Three-level deletion suggestion (keep/mild/strong)
 - Task persistence to JSON file
 - History API
@@ -16,10 +16,10 @@ import tempfile
 import traceback
 import logging
 import asyncio
-import httpx
+import platform
 from typing import List, Dict, Optional
 from datetime import datetime
-from http import HTTPStatus
+import httpx
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -28,50 +28,97 @@ if sys.platform == "win32":
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("fx281")
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "REDACTED")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
-import dashscope
-dashscope.api_key = DASHSCOPE_API_KEY
-
-QWEN_MODEL = "qwen-max"
+LLM_PROVIDER = "deepseek"
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-pro")
 ASR_MODE = os.getenv("ASR_MODE", "local")
+
+if not DEEPSEEK_API_KEY:
+    logger.warning("DEEPSEEK_API_KEY 未设置，云端文本分析将不可用")
+if ASR_MODE == "dashscope" and not DASHSCOPE_API_KEY:
+    logger.warning("ASR_MODE=dashscope 但 DASHSCOPE_API_KEY 未设置，云端转写将失败")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
-from openai import OpenAI
-qwen_client = OpenAI(api_key=DASHSCOPE_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+os.environ["MODELSCOPE_CACHE"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "modelscope_cache")
 
-from openai import AsyncOpenAI
-qwen_async_client = AsyncOpenAI(api_key=DASHSCOPE_API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+from openai import OpenAI
+deepseek_client = (
+    OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+    if DEEPSEEK_API_KEY else None
+)
+
+# Make ffmpeg/ffprobe discoverable in PATH (used by funasr's _load_audio_ffmpeg and pydub's mediainfo)
+import shutil as _shutil
+# 1. Add Homebrew bin (macOS Apple Silicon) to PATH if present
+_brew_bin = "/opt/homebrew/bin"
+if os.path.isdir(_brew_bin) and _brew_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _brew_bin + os.pathsep + os.environ.get("PATH", "")
+# 2. Fall back to bundled imageio-ffmpeg if system ffmpeg still not found
+if not _shutil.which("ffmpeg"):
+    try:
+        import imageio_ffmpeg
+        _ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        _ffmpeg_dir = os.path.dirname(_ffmpeg_exe)
+        _ffmpeg_link = os.path.join(_ffmpeg_dir, "ffmpeg")
+        if not os.path.exists(_ffmpeg_link):
+            os.symlink(os.path.basename(_ffmpeg_exe), _ffmpeg_link)
+        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        logger.info(f"System ffmpeg not found; added bundled to PATH: {_ffmpeg_dir}")
+    except Exception as _e:
+        logger.warning(f"Could not configure bundled ffmpeg: {_e}")
+else:
+    logger.info(f"Using system ffmpeg: {_shutil.which('ffmpeg')}, ffprobe: {_shutil.which('ffprobe')}")
 
 _local_asr_model = None
+_local_vad_model = None
+_local_asr_failed = False
 
 def _get_local_asr():
-    global _local_asr_model
+    global _local_asr_model, _local_asr_failed
     if _local_asr_model is not None:
         return _local_asr_model
+    if _local_asr_failed:
+        return None
     try:
         from funasr import AutoModel
         logger.info("Loading local SenseVoice model...")
         _local_asr_model = AutoModel(
             model="iic/SenseVoiceSmall",
-            vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            vad_kwargs={"max_single_segment_time": 60000},
             device="cuda" if _check_cuda() else "cpu",
-            disable_update=True,
         )
         logger.info("Local SenseVoice model loaded successfully!")
         return _local_asr_model
     except Exception as e:
         logger.warning(f"Failed to load local ASR model: {e}")
-        _local_asr_model = False
+        _local_asr_failed = True
+        return None
+
+def _get_local_vad():
+    global _local_vad_model
+    if _local_vad_model is not None:
+        return _local_vad_model
+    try:
+        from funasr import AutoModel
+        logger.info("Loading local VAD model...")
+        _local_vad_model = AutoModel(
+            model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            device="cuda" if _check_cuda() else "cpu",
+        )
+        logger.info("Local VAD model loaded successfully!")
+        return _local_vad_model
+    except Exception as e:
+        logger.warning(f"Failed to load VAD model: {e}")
+        _local_vad_model = False
         return None
 
 def _check_cuda():
@@ -83,7 +130,7 @@ def _check_cuda():
 
 tasks: Dict[str, dict] = {}
 
-app = FastAPI(title="FX281 API", version="12.0.0")
+app = FastAPI(title="FX281 API", version="13.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -93,141 +140,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-QWEN_BATCH_PROMPT = """你是一个专业的播客剪辑助手。以下是播客的部分转录文本（带时间戳）：
+DEEPSEEK_BATCH_PROMPT = """你是专业音频剪辑师和内容策划专家，负责播客与访谈节目的粗剪。逐句分析以下转录，标注说话人和剪辑建议。
 
 {transcript_text}
 
-请仔细阅读以上文本，完成以下分析：
+## 说话人
+根据对话推断。host=主持人(提问/引导/总结/捧哏)，guest=嘉宾(回答/讲述/分享)。用 Speaker_A/B/C 标识。
 
-## 任务1：说话人识别
-语音转文字工具无法区分说话人，所以所有段落都被标记为同一个说话人。你需要根据对话内容推断每段话的实际说话人：
-- 仔细分析语气、用词、话题角色，判断哪些段落是同一个人说的
-- 播客通常有2-4个说话人（主持人+1-3个嘉宾）
-- 主持人(host)特征：提问、引导话题、总结、过渡
-- 被访人(guest)特征：回答问题、分享经历、讲述观点
-- 为每个说话人分配标识：Speaker_A, Speaker_B, Speaker_C 等
-- 判断角色：host 或 guest
+## 剪辑建议
+**strong（强烈删减，必须剪掉）**
+- 准备测试：喂喂喂、能听到吗、调麦克风、开始录了吗
+- 意外打断：咳嗽喝水、外人闯入、外卖到了、接个电话
+- 偏离主题：与核心话题完全无关的闲聊
+- 风险敏感：脏话谩骂、政治敏感、得罪人的不当言论
 
-## 任务2：删减建议（三级体系）
-请对每段话给出删减建议，分为三个等级：
+**mild（一般删减，后期优化）**
+- 严重口癖：大量无意义的"然后""就是说""那个""额""啊"，影响连贯
+- 结巴重复：自我重复（"我我觉得，我觉得..."），保留完整那句即可
+- 逻辑断层：说到一半转话题，前半句无实质信息
 
-**keep（保留）**：句子有实质语义价值，应当保留。
-- 包含有价值的观点、经历、信息
-- 回忆性叙述（即使有重复和口癖）
-- 带有停顿但语义完整的句子
-- 虽然啰嗦但传达了实质内容的句子
-- 包含情感表达的句子
+**keep（保留，核心骨架）**
+- 核心观点：表达清晰、逻辑完整的关键信息
+- 自然互动：推动话题的提问、恰当捧哏（"确实""我同意"）
+- 情绪价值：活跃气氛、展现性格的幽默或感叹
 
-**mild（一般删减建议）**：句子有一定冗余，删不删都可以，由人决定。
-- 带有大量口癖但仍有少量信息（去掉口癖后信息很少）
-- 与前文高度重复的表述（不是回忆性重复，而是无意义的重复）
-- 过长的过渡或铺垫，核心信息已在其他段落表达
-- 语气词+少量附和内容
+原因标签：filler(口癖) echo(附和) noise(杂音) redundant(冗余) off_topic(离题) stutter(结巴) sensitive(敏感)
+mild/strong 需填 reason 和 reasonDetail(10字内解读)。
 
-**strong（强烈删减建议）**：句子应当删除，没有保留价值。
-- 纯语气词：整句只有"嗯"、"啊"、"哦"
-- 纯附和：整句只有"嗯嗯"、"对对"、"好好好"，无附加观点
-- 纯杂音：笑声、咳嗽等非语言内容
+返回 JSON：
+{{"segments":[{{"id":1,"speaker":"Speaker_A","speakerRole":"host","suggestion":"keep","reason":null,"reasonDetail":null}}]}}
+只输出 JSON。"""
 
-**判断原则**：
-- 播客采访的对象可能是老人、教授，他们说话带有停顿、重复是正常的表达习惯
-- 不要因为句子中包含口癖、停顿就标记删除，要判断去掉口癖后是否还有实质内容
-- 有疑问时优先标 mild 而非 strong，让人类做最终决策
-
-删减原因分类（对 mild 和 strong 使用）：
-- filler：语气词/口癖
-- echo：附和/重复
-- noise：杂音/笑声
-- redundant：冗余/过度铺垫
-
-对每个非 keep 的句子，给出简短解读（15字以内）。
-
-## 返回格式
-返回 JSON 对象：
-{{
-  "segments": [
-    {{
-      "id": 1,
-      "speaker": "Speaker_A",
-      "speakerRole": "host",
-      "text": "原文",
-      "startTime": 0.0,
-      "endTime": 1.0,
-      "suggestion": "keep",
-      "reason": null,
-      "reasonDetail": null
-    }},
-    {{
-      "id": 2,
-      "speaker": "Speaker_B",
-      "speakerRole": "guest",
-      "text": "嗯嗯",
-      "startTime": 1.0,
-      "endTime": 1.5,
-      "suggestion": "strong",
-      "reason": "echo",
-      "reasonDetail": "纯附和无观点"
-    }},
-    {{
-      "id": 3,
-      "speaker": "Speaker_B",
-      "speakerRole": "guest",
-      "text": "然后那个时候就是说我记得很清楚，就是七六年的时候",
-      "startTime": 1.5,
-      "endTime": 5.0,
-      "suggestion": "keep",
-      "reason": null,
-      "reasonDetail": null
-    }},
-    {{
-      "id": 4,
-      "speaker": "Speaker_A",
-      "speakerRole": "host",
-      "text": "对对对，然后呢然后呢",
-      "startTime": 5.0,
-      "endTime": 6.0,
-      "suggestion": "mild",
-      "reason": "echo",
-      "reasonDetail": "附和带少量催促"
-    }}
-  ]
-}}
-
-注意第3个示例：虽然句子带有"然后"、"就是说"等口癖，但整句包含有价值的回忆信息，应当 keep。
-注意第4个示例：虽然"然后呢"有催促含义，但核心是附和，标 mild 让人决策。
-必须为每一段文本都返回一个 segments 对象！所有文字使用简体中文。只输出 JSON。"""
-
-QWEN_CHAPTER_PROMPT = """你是一个专业的播客编辑。以下是播客的完整转录文本（带时间戳和说话人），请通读全文后进行章节划分。
+DEEPSEEK_CHAPTER_PROMPT = """你是播客编辑。根据以下完整转录，划分5-7个章节。
 
 {transcript_text}
 
-## 章节划分要求
-1. 仔细通读全文，根据话题的自然变化划分章节
-2. 章节数量：3-7个（根据内容丰富程度调整）
-3. 每个章节标题要简洁精准地概括该段核心话题（5-10字）
-4. 章节之间应当有明确的话题转换（如：从自我介绍转到回忆经历，从一段经历转到另一段，从讨论转到总结等）
-5. startTime 取该章节第一句话的时间，endTime 取该章节最后一句话的时间
-6. 章节必须覆盖全部时间范围，不能有遗漏
+要求：
+- 按话题自然转折划分，不按时间均匀切分
+- 标题5-10字，具体不泛泛（如"早年求学经历"而非"第一部分"）
+- startTime/endTime 取该章节首尾句时间，连续不遗漏
+- 即使全篇一个主题，也从不同角度切出至少5章
 
-## 章节划分原则
-- 不要按时间均匀切分，要按话题自然转折点切分
-- 一个话题可能很长（占一半音频），也可能很短（只有几段），这很正常
-- 标题要具体，不要用"第一部分"这种泛泛的标题
-- 如果整段音频都在聊一个话题，至少也要分3个章节（开头、主体、收尾）
+返回 JSON：
+{{"chapters":[{{"title":"开场介绍","startTime":0,"endTime":120}}]}}
+只输出 JSON。"""
 
-## 返回格式
-返回 JSON 对象：
-{{
-  "chapters": [
-    {{"title": "开场与自我介绍", "startTime": 0.0, "endTime": 120.0}},
-    {{"title": "早年求学经历", "startTime": 120.0, "endTime": 350.0}},
-    {{"title": "创作转型与突破", "startTime": 350.0, "endTime": 600.0}},
-    {{"title": "对行业现状的看法", "startTime": 600.0, "endTime": 800.0}},
-    {{"title": "未来展望与寄语", "startTime": 800.0, "endTime": 950.0}}
-  ]
-}}
 
-只输出 JSON。所有文字使用简体中文。"""
+DEEPSEEK_SUMMARY_PROMPT = """你是播客编辑。根据以下转录，写一段150-250字的内容概述。
+
+{transcript_text}
+
+要求：概括主题、人物、关键话题、整体氛围。简洁流畅，不罗列时间戳。
+
+返回 JSON：
+{{"summary":"这是一段关于...的访谈..."}}
+只输出 JSON。"""
 
 
 def format_time(seconds: float) -> str:
@@ -275,8 +242,42 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+def _split_sentences(text: str) -> list:
+    parts = re.split(r'(?<=[。！？；])', text)
+    result = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > 50:
+            subs = re.split(r'(?<=[，,])', p)
+            buf = ""
+            for s in subs:
+                s = s.strip()
+                if not s:
+                    continue
+                if buf and len(buf) + len(s) > 50:
+                    result.append(buf)
+                    buf = s
+                else:
+                    buf = (buf + s) if buf else s
+            if buf:
+                result.append(buf)
+        else:
+            result.append(p)
+    if not result:
+        return [text]
+    return result
+
+
 def _classify_reason(text: str) -> str:
     t = text.lower()
+    for kw in ['敏感', '脏话', '谩骂', '政治', '得罪', '不当言论', 'sensitive']:
+        if kw in t: return "sensitive"
+    for kw in ['离题', '无关', '打断', '准备', '调试', '寒暄', '休息', 'off_topic', 'offtopic']:
+        if kw in t: return "off_topic"
+    for kw in ['结巴', '重复', '自我重复', 'stutter']:
+        if kw in t: return "stutter"
     for kw in ['冗余', '铺垫', '重复表述', 'redundant', '过渡']:
         if kw in t: return "redundant"
     for kw in ['附和', '嗯嗯', '对对', 'echo', '应和', '无观点', '催促']:
@@ -287,7 +288,9 @@ def _classify_reason(text: str) -> str:
 
 
 def _suggestion_to_isKept(suggestion: str) -> bool:
-    return suggestion != "strong"
+    # AI suggestions never execute deletions. Every segment starts as kept and
+    # only a user's explicit checkbox decision may change isKept to False.
+    return True
 
 
 # ============================================
@@ -303,9 +306,11 @@ def _save_task_to_disk(task_id: str):
         "task_id": task_id,
         "filename": task.get("filename", ""),
         "created_at": task.get("created_at", ""),
+        "file_path": task.get("file_path", ""),
         "segments": task.get("segments", []),
         "speakers": task.get("speakers", []),
         "chapters": task.get("chapters", []),
+        "summary": task.get("summary", ""),
     }
     history = _load_history()
     found = False
@@ -345,75 +350,105 @@ def _load_task_from_disk(task_id: str) -> Optional[dict]:
 # Local ASR via FunASR
 # ============================================
 async def _local_transcribe(file_path: str, task_id: str) -> List[dict]:
-    model = _get_local_asr()
-    if model is None or model is False:
-        raise Exception("Local ASR model not available")
+    vad_model = await asyncio.to_thread(_get_local_vad)
+    if vad_model is None or vad_model is False:
+        raise Exception("VAD model not available")
+    asr_model = await asyncio.to_thread(_get_local_asr)
+    if asr_model is None:
+        raise Exception("ASR model not available")
 
-    logger.info(f"[{task_id}] Running local SenseVoice transcription...")
-
-    result = await asyncio.wait_for(
-        asyncio.to_thread(
-            model.generate,
-            input=file_path,
-            language="zh",
-            use_itn=True,
-            batch_size_s=60,
-        ),
-        timeout=600.0,
+    logger.info(f"[{task_id}] Running VAD segmentation...")
+    vad_result = await asyncio.wait_for(
+        asyncio.to_thread(vad_model.generate, input=file_path),
+        timeout=900.0,
     )
 
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(file_path)
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+
+    speech_segments = []
+    if vad_result and len(vad_result) > 0:
+        for item in vad_result:
+            segments = item.get("value", item.get("text", []))
+            if isinstance(segments, list):
+                for t in segments:
+                    if isinstance(t, (list, tuple)) and len(t) >= 2:
+                        start_ms, end_ms = int(t[0]), int(t[1])
+                        dur_ms = end_ms - start_ms
+                        if dur_ms < 500:
+                            continue
+                        speech_segments.append((start_ms, end_ms))
+
+    if not speech_segments:
+        logger.warning(f"[{task_id}] VAD found no speech, using whole file")
+        speech_segments = [(0, len(audio))]
+
+    logger.info(f"[{task_id}] VAD found {len(speech_segments)} speech segments")
+
     raw_segments = []
-    if result and len(result) > 0:
-        for res in result:
-            if isinstance(res, dict):
-                text = res.get("text", "")
-                timestamp = res.get("timestamp", [])
-                if timestamp and isinstance(timestamp, list):
-                    for ts in timestamp:
-                        if isinstance(ts, (list, tuple)) and len(ts) >= 3:
-                            start_ms = ts[0]
-                            end_ms = ts[1]
-                            seg_text = str(ts[2]).strip() if len(ts) > 2 else ""
-                            seg_text = _clean(seg_text)
-                            if seg_text:
-                                raw_segments.append({
-                                    "start": round(start_ms / 1000.0, 2),
-                                    "end": round(end_ms / 1000.0, 2),
-                                    "text": seg_text,
-                                })
-                elif text:
-                    text = _clean(text)
-                    if text:
-                        raw_segments.append({"start": 0, "end": 0, "text": text})
-            elif isinstance(res, list):
-                for item in res:
-                    if isinstance(item, dict):
-                        text = item.get("text", "")
-                        timestamp = item.get("timestamp", [])
-                        if timestamp and isinstance(timestamp, list):
-                            for ts in timestamp:
-                                if isinstance(ts, (list, tuple)) and len(ts) >= 3:
-                                    start_ms = ts[0]
-                                    end_ms = ts[1]
-                                    seg_text = str(ts[2]).strip() if len(ts) > 2 else ""
-                                    seg_text = _clean(seg_text)
-                                    if seg_text:
-                                        raw_segments.append({
-                                            "start": round(start_ms / 1000.0, 2),
-                                            "end": round(end_ms / 1000.0, 2),
-                                            "text": seg_text,
-                                        })
-                        elif text:
-                            text = _clean(text)
-                            if text:
-                                raw_segments.append({"start": 0, "end": 0, "text": text})
+    total_segments = len(speech_segments)
+
+    for seg_idx, (start_ms, end_ms) in enumerate(speech_segments):
+        tasks[task_id]["progress"] = f"本地语音转文字... {seg_idx + 1}/{total_segments}"
+
+        dur_ms = end_ms - start_ms
+        if dur_ms < 300:
+            continue
+
+        chunk_audio = audio[start_ms:end_ms]
+        if len(chunk_audio) < 100:
+            continue
+
+        chunk_path = file_path + f".chunk_{seg_idx}.wav"
+        chunk_audio.export(chunk_path, format="wav")
+
+        try:
+            seg_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    asr_model.generate,
+                    input=chunk_path,
+                    language="zh",
+                    use_itn=True,
+                ),
+                timeout=300.0,
+            )
+
+            if seg_result and len(seg_result) > 0:
+                res = seg_result[0]
+                if isinstance(res, dict):
+                    seg_text = _clean(res.get("text", ""))
+                    if seg_text and not seg_text.startswith("<|"):
+                        sentences = _split_sentences(seg_text)
+                        total = max(sum(len(s) for s in sentences), 1)
+                        chunk_start = start_ms / 1000.0
+                        chunk_end = end_ms / 1000.0
+                        chunk_dur = chunk_end - chunk_start
+                        t = chunk_start
+                        for sentence in sentences:
+                            s_dur = max((len(sentence) / total) * chunk_dur, 0.3)
+                            raw_segments.append({
+                                "start": round(t, 2),
+                                "end": round(t + s_dur, 2),
+                                "text": sentence,
+                            })
+                            t += s_dur
+        except asyncio.TimeoutError:
+            logger.warning(f"[{task_id}] Segment {seg_idx + 1}/{total_segments} timeout, skipped")
+        except Exception as e:
+            logger.warning(f"[{task_id}] Segment {seg_idx + 1}/{total_segments} error: {e}")
+        finally:
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
 
     logger.info(f"[{task_id}] Local ASR raw segments: {len(raw_segments)}")
     return raw_segments
 
 
 # ============================================
-# DashScope ASR (fallback)
+# DashScope ASR (云端转写，部署用)
 # ============================================
 async def _upload_to_dashscope_oss(file_path: str, filename: str) -> str:
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=120.0, read=600.0, write=1200.0, pool=120.0)) as http_client:
@@ -521,7 +556,7 @@ async def _fetch_transcription_url(url: str) -> dict:
             r = await c.get(url)
             if r.status_code == 200:
                 return r.json()
-    except:
+    except Exception:
         pass
     return {}
 
@@ -542,7 +577,7 @@ def _parse_transcription_data(data: dict) -> List[dict]:
                     "end": round(s.get("end_time", 0) / 1000.0, 2),
                     "text": s_text,
                 })
-    except:
+    except Exception:
         pass
     return segments
 
@@ -553,33 +588,21 @@ def _parse_transcription_data(data: dict) -> List[dict]:
 async def upload_and_transcribe(file_path: str, filename: str, task_id: str) -> List[dict]:
     raw_segments = []
 
-    if ASR_MODE == "local":
-        try:
-            logger.info(f"[{task_id}] Using LOCAL SenseVoice ASR")
-            tasks[task_id]["progress"] = "本地语音转文字... 10%"
-            tasks[task_id]["percent"] = 10
-            raw_segments = await _local_transcribe(file_path, task_id)
-            if raw_segments:
-                logger.info(f"[{task_id}] Local ASR succeeded: {len(raw_segments)} segments")
-            else:
-                raise Exception("Local ASR returned empty results")
-        except Exception as e:
-            logger.warning(f"[{task_id}] Local ASR failed: {e}, falling back to DashScope...")
-            tasks[task_id]["progress"] = "云端语音转文字... 10%"
-            tasks[task_id]["percent"] = 10
-            raw_segments = await _dashscope_transcribe(file_path, filename, task_id)
-    else:
+    if ASR_MODE == "dashscope":
         logger.info(f"[{task_id}] Using DashScope ASR")
         tasks[task_id]["progress"] = "上传音频到云端... 5%"
         tasks[task_id]["percent"] = 5
         raw_segments = await _dashscope_transcribe(file_path, filename, task_id)
+    else:
+        logger.info(f"[{task_id}] Using LOCAL SenseVoice ASR")
+        tasks[task_id]["progress"] = "本地语音转文字... 10%"
+        tasks[task_id]["percent"] = 10
+        raw_segments = await _local_transcribe(file_path, task_id)
+        if not raw_segments:
+            logger.error(f"[{task_id}] Local ASR returned empty results")
+            return []
 
-    if not raw_segments:
-        return []
-
-    tasks[task_id]["progress"] = "合并段落... 25%"
-    tasks[task_id]["percent"] = 25
-    merged = merge_segments(raw_segments)
+    merged = merge_segments(raw_segments, min_chars=20, max_gap=1.5, max_chars=50)
     segments = []
     for i, seg in enumerate(merged):
         segments.append({
@@ -593,7 +616,7 @@ async def upload_and_transcribe(file_path: str, filename: str, task_id: str) -> 
 
 
 # ============================================
-# Qwen analysis
+# DeepSeek analysis
 # ============================================
 def parse_json_response(response_text: str):
     for prefix in ["```json", "```"]:
@@ -627,28 +650,38 @@ def parse_json_response(response_text: str):
     return None
 
 
-async def _call_qwen(prompt: str, task_id: str, label: str, retries: int = 3) -> str | None:
+async def _call_deepseek(prompt: str, task_id: str, label: str, retries: int = 3) -> Optional[str]:
+    if deepseek_client is None:
+        raise RuntimeError("缺少 DEEPSEEK_API_KEY 环境变量，无法执行云端文本分析。")
     for attempt in range(1, retries + 1):
         try:
             resp = await asyncio.wait_for(
-                qwen_async_client.chat.completions.create(
-                    model=QWEN_MODEL,
+                asyncio.to_thread(
+                    deepseek_client.chat.completions.create,
+                    model=LLM_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                 ),
-                timeout=300.0,
+                timeout=1200.0,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+            logger.warning(f"[{task_id}] {label}: Model returned empty content (attempt {attempt})")
+            if attempt < retries:
+                await asyncio.sleep(3)
         except asyncio.TimeoutError:
-            logger.warning(f"[{task_id}] {label} timeout attempt {attempt}/{retries}")
+            logger.warning(f"[{task_id}] {label}: Timeout (attempt {attempt}/{retries})")
             if attempt < retries:
                 await asyncio.sleep(5)
         except Exception as e:
-            err = str(e).lower()
-            logger.warning(f"[{task_id}] {label} error: {e}")
-            if any(k in err for k in ['503', '429', 'overload', 'rate_limit']) and attempt < retries:
+            err = str(e)
+            logger.warning(f"[{task_id}] {label}: Error - {err[:200]} (attempt {attempt}/{retries})")
+            if any(k in err.lower() for k in ['503', '429', 'overload', 'rate_limit', 'server_error']) and attempt < retries:
                 await asyncio.sleep(10 * attempt)
-            else:
+            elif attempt >= retries:
                 break
+            else:
+                await asyncio.sleep(5)
     return None
 
 
@@ -692,49 +725,53 @@ def _normalize_suggestion(val) -> str:
     return "keep"
 
 
-async def _analyze_batch(batch: List[dict], batch_num: int, total: int, task_id: str, sem: asyncio.Semaphore) -> List[dict]:
-    async with sem:
-        lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s['speaker']}: {s['text']}" for s in batch]
-        prompt = QWEN_BATCH_PROMPT.format(transcript_text="\n".join(lines))
-        response_text = await _call_qwen(prompt, task_id, f"Batch {batch_num}/{total}")
-        if not response_text:
-            return batch
-        parsed = parse_json_response(response_text)
-        if parsed and isinstance(parsed, dict):
-            bs = parsed.get("segments", [])
-            if bs and isinstance(bs, list):
-                return bs
-        elif parsed and isinstance(parsed, list):
-            return parsed
-        return batch
-
-
-async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
-    BATCH_SIZE = 50
+async def analyze_with_deepseek(segments: List[dict], task_id: str) -> dict:
+    BATCH_SIZE = 25
     batches = []
     for batch_start in range(0, len(segments), BATCH_SIZE):
-        batches.append(segments[batch_start:batch_start + BATCH_SIZE])
-    total = len(batches)
+        batch = segments[batch_start:batch_start + BATCH_SIZE]
+        batch_num = batch_start // BATCH_SIZE + 1
+        total = (len(segments) + BATCH_SIZE - 1) // BATCH_SIZE
+        lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s['speaker']}: {s['text']}" for s in batch]
+        prompt = DEEPSEEK_BATCH_PROMPT.format(transcript_text="\n".join(lines))
+        batches.append((batch_num, total, batch, prompt))
 
     sem = asyncio.Semaphore(3)
-    completed_count = 0
+    results_map = {}
 
-    async def _run_batch(idx: int) -> List[dict]:
-        nonlocal completed_count
-        result = await _analyze_batch(batches[idx], idx + 1, total, task_id, sem)
-        completed_count += 1
-        pct = 30 + int(completed_count / total * 50)
-        tasks[task_id]["progress"] = f"千问文本分析... 批次 {completed_count}/{total} ({pct}%)"
-        tasks[task_id]["percent"] = pct
-        return result
+    async def process_batch(batch_num: int, total: int, batch: list, prompt: str):
+        async with sem:
+            tasks[task_id]["progress"] = f"DeepSeek 分析 Batch {batch_num}/{total}"
+            response_text = await _call_deepseek(prompt, task_id, f"Batch {batch_num}/{total}")
+            if not response_text:
+                logger.warning(f"[{task_id}] Batch {batch_num}/{total}: returned empty, using defaults")
+                return batch_num, list(batch)
+            parsed = parse_json_response(response_text)
+            if parsed and isinstance(parsed, dict):
+                bs = parsed.get("segments", [])
+                if bs and isinstance(bs, list):
+                    if len(bs) != len(batch):
+                        logger.warning(f"[{task_id}] Batch {batch_num}/{total}: expected {len(batch)} got {len(bs)}")
+                    return batch_num, bs
+                else:
+                    logger.warning(f"[{task_id}] Batch {batch_num}/{total}: no segments key")
+                    return batch_num, list(batch)
+            elif parsed and isinstance(parsed, list):
+                if len(parsed) != len(batch):
+                    logger.warning(f"[{task_id}] Batch {batch_num}/{total}: expected {len(batch)} got {len(parsed)}")
+                return batch_num, list(parsed)
+            else:
+                logger.warning(f"[{task_id}] Batch {batch_num}/{total}: parse failed. Raw: {response_text[:200]}")
+                return batch_num, list(batch)
 
-    logger.info(f"[{task_id}] Starting {total} batch(es) with concurrency=3")
-
-    batch_results = await asyncio.gather(*[_run_batch(i) for i in range(total)])
+    coros = [process_batch(bn, bt, b, p) for bn, bt, b, p in batches]
+    gathered = await asyncio.gather(*coros)
+    for bn, result in sorted(gathered, key=lambda x: x[0]):
+        results_map[bn] = result
 
     all_analyzed = []
-    for result in batch_results:
-        all_analyzed.extend(result)
+    for bn in sorted(results_map):
+        all_analyzed.extend(results_map[bn])
 
     result_segments = []
     for i, seg in enumerate(segments):
@@ -745,7 +782,7 @@ async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
                 suggestion = "strong"
             reason_val = a.get("reason") if suggestion != "keep" else None
             reason_detail = a.get("reasonDetail") if suggestion != "keep" else None
-            if reason_val and reason_val not in ("filler", "echo", "noise", "redundant"):
+            if reason_val and reason_val not in ("filler", "echo", "noise", "redundant", "off_topic", "stutter", "sensitive"):
                 reason_val = _classify_reason(str(reason_val))
             if suggestion != "keep" and not reason_val:
                 reason_val = _classify_reason(reason_detail or "")
@@ -766,13 +803,13 @@ async def analyze_with_qwen(segments: List[dict], task_id: str) -> dict:
 
     speakers = _extract_speakers(result_segments)
 
-    tasks[task_id]["progress"] = "生成章节导览... 85%"
-    tasks[task_id]["percent"] = 85
     valid_chapters = await _generate_chapters(result_segments, task_id)
     if not valid_chapters:
         valid_chapters = _auto_chapter(result_segments)
 
-    return {"segments": result_segments, "speakers": speakers, "chapters": valid_chapters}
+    summary = await _generate_summary(result_segments, task_id)
+
+    return {"segments": result_segments, "speakers": speakers, "chapters": valid_chapters, "summary": summary}
 
 
 async def _generate_chapters(segments: List[dict], task_id: str) -> List[dict]:
@@ -791,8 +828,8 @@ async def _generate_chapters(segments: List[dict], task_id: str) -> List[dict]:
         lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s.get('speaker', 'Speaker_A')}: {s['text']}" for s in sampled]
         full_text = "\n".join(lines)
 
-    prompt = QWEN_CHAPTER_PROMPT.format(transcript_text=full_text)
-    response_text = await _call_qwen(prompt, task_id, "Chapter generation")
+    prompt = DEEPSEEK_CHAPTER_PROMPT.format(transcript_text=full_text)
+    response_text = await _call_deepseek(prompt, task_id, "Chapter generation")
 
     if not response_text:
         return []
@@ -826,28 +863,53 @@ async def _generate_chapters(segments: List[dict], task_id: str) -> List[dict]:
     return valid
 
 
+async def _generate_summary(segments: List[dict], task_id: str) -> str:
+    if not segments:
+        return ""
+
+    kept = [s for s in segments if s.get("isKept", True)]
+    source = kept if len(kept) > 10 else segments
+
+    lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s.get('speaker', 'Speaker_A')}: {s['text']}" for s in source]
+    full_text = "\n".join(lines)
+
+    if len(full_text) > 30000:
+        step = max(1, len(source) // 200)
+        sampled = source[::step]
+        lines = [f"[{format_time(s['startTime'])} - {format_time(s['endTime'])}] {s.get('speaker', 'Speaker_A')}: {s['text']}" for s in sampled]
+        full_text = "\n".join(lines)
+
+    prompt = DEEPSEEK_SUMMARY_PROMPT.format(transcript_text=full_text)
+    response_text = await _call_deepseek(prompt, task_id, "Summary generation")
+
+    if not response_text:
+        return ""
+
+    parsed = parse_json_response(response_text)
+    if parsed and isinstance(parsed, dict):
+        return str(parsed.get("summary", "")).strip()
+    return ""
+
+
 # ============================================
 # Background task processor
 # ============================================
 async def _process_audio_task(task_id: str, file_path: str, filename: str):
     try:
         tasks[task_id]["status"] = "transcribing"
-        asr_label = "本地语音转文字" if ASR_MODE == "local" else "云端语音转文字"
-        tasks[task_id]["progress"] = f"{asr_label}... 0%"
-        tasks[task_id]["percent"] = 0
+        tasks[task_id]["progress"] = "本地语音转文字..."
         segments = await upload_and_transcribe(file_path, filename, task_id)
         if not segments:
             raise Exception("语音转文字返回空结果，音频可能为静音或已损坏")
         tasks[task_id]["status"] = "analyzing"
-        tasks[task_id]["progress"] = f"千问文本分析... 0%"
-        tasks[task_id]["percent"] = 30
-        analysis = await analyze_with_qwen(segments, task_id)
+        tasks[task_id]["progress"] = f"DeepSeek 文本分析... (共 {len(segments)} 段)"
+        analysis = await analyze_with_deepseek(segments, task_id)
         tasks[task_id]["status"] = "completed"
-        tasks[task_id]["progress"] = "完成! 100%"
-        tasks[task_id]["percent"] = 100
+        tasks[task_id]["progress"] = "完成!"
         tasks[task_id]["segments"] = analysis["segments"]
         tasks[task_id]["speakers"] = analysis["speakers"]
         tasks[task_id]["chapters"] = analysis["chapters"]
+        tasks[task_id]["summary"] = analysis.get("summary", "")
         tasks[task_id]["message"] = f"处理完成，共 {len(analysis['segments'])} 段"
         _save_task_to_disk(task_id)
     except Exception as e:
@@ -857,7 +919,6 @@ async def _process_audio_task(task_id: str, file_path: str, filename: str):
         tasks[task_id]["status"] = "failed"
         tasks[task_id]["error"] = err_msg
         tasks[task_id]["progress"] = f"处理失败: {err_msg}"
-        tasks[task_id]["percent"] = 0
 
 
 # ============================================
@@ -870,7 +931,8 @@ def _generate_word(task_data: dict, speaker_names: dict) -> str:
 
     doc = Document()
     style = doc.styles['Normal']
-    style.font.name = 'Microsoft YaHei'
+    # Cross-platform CJK font: PingFang SC on macOS, Microsoft YaHei on Windows
+    style.font.name = 'PingFang SC' if platform.system() == 'Darwin' else 'Microsoft YaHei'
     style.font.size = Pt(11)
 
     title = doc.add_heading('FX281 Studio 播客粗剪文稿', level=0)
@@ -990,18 +1052,11 @@ def _generate_mp3(task_data: dict, original_file_path: str) -> str:
 # ============================================
 # API Routes
 # ============================================
-def _get_user_code(request: Request) -> str:
-    code = request.headers.get("X-User-Code", "").strip()
-    if not code or len(code) != 6 or not code.isdigit():
-        raise HTTPException(status_code=401, detail="请输入6位用户代码")
-    return code
-
-
 @app.get("/")
 async def root():
     return {
-        "status": "ok", "service": "FX281 API", "version": "12.0.0",
-        "asr_mode": ASR_MODE, "qwen_model": QWEN_MODEL,
+        "status": "ok", "service": "FX281 API", "version": "13.0.0",
+        "asr_mode": ASR_MODE, "llm_provider": LLM_PROVIDER, "llm_model": LLM_MODEL,
     }
 
 
@@ -1011,13 +1066,10 @@ async def health_check():
 
 
 @app.get("/api/history")
-async def get_history(request: Request):
-    user_code = _get_user_code(request)
+async def get_history():
     history = _load_history()
     summaries = []
     for h in history:
-        if h.get("user_code") != user_code:
-            continue
         summaries.append({
             "task_id": h.get("task_id"),
             "filename": h.get("filename", ""),
@@ -1031,44 +1083,54 @@ async def get_history(request: Request):
 
 
 @app.get("/api/history/{task_id}")
-async def get_history_detail(task_id: str, request: Request):
-    user_code = _get_user_code(request)
+async def get_history_detail(task_id: str):
     record = _load_task_from_disk(task_id)
-    if not record or record.get("user_code") != user_code:
+    if not record:
         raise HTTPException(status_code=404, detail="Task not found in history")
     return JSONResponse(content=record)
 
 
 @app.delete("/api/history/{task_id}")
-async def delete_history(task_id: str, request: Request):
-    user_code = _get_user_code(request)
+async def delete_history(task_id: str):
     history = _load_history()
     target = None
     for h in history:
         if h.get("task_id") == task_id:
-            if h.get("user_code") != user_code:
-                raise HTTPException(status_code=403, detail="无权删除此记录")
             target = h
             break
     if not target:
         raise HTTPException(status_code=404, detail="Task not found in history")
+
     new_history = [h for h in history if h.get("task_id") != task_id]
     try:
         with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(new_history, f, ensure_ascii=False, indent=2)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete: {e}")
+
     if task_id in tasks:
+        file_path = tasks[task_id].get("file_path")
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
         del tasks[task_id]
+
+    file_path = target.get("file_path", "")
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
     return JSONResponse(content={"status": "ok", "deleted": task_id})
 
 
 @app.post("/api/process-audio")
-async def process_audio(request: Request, file: UploadFile = File(...)):
+async def process_audio(file: UploadFile = File(...)):
     if not file:
         raise HTTPException(status_code=400, detail="No file uploaded")
-
-    user_code = _get_user_code(request)
 
     allowed = ['.mp3', '.m4a', '.wav', '.flac', '.mp4', '.aac', '.ogg']
     ext = os.path.splitext(file.filename)[1].lower() if file.filename else ''
@@ -1078,11 +1140,8 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
     tmp = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
+            content = await file.read()
+            f.write(content)
             tmp = f.name
     except Exception as e:
         if tmp and os.path.exists(tmp): os.remove(tmp)
@@ -1090,57 +1149,107 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
 
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
-        "status": "uploaded", "progress": "文件已上传...", "percent": 0,
+        "status": "uploaded", "progress": "文件已上传...",
         "segments": None, "speakers": None, "chapters": None,
-        "error": None, "message": None, "filename": file.filename,
-        "original_file": tmp,
+        "summary": None, "error": None, "message": None,
+        "filename": file.filename,
         "created_at": datetime.now().isoformat(),
-        "user_code": user_code,
+        "file_path": tmp,
     }
+
     asyncio.create_task(_process_audio_task(task_id, tmp, file.filename))
+
     return JSONResponse(content={"task_id": task_id, "status": "uploaded"})
 
 
 @app.get("/api/task/{task_id}")
-async def get_task_status(task_id: str):
-    if task_id not in tasks:
+async def get_task(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
         record = _load_task_from_disk(task_id)
         if record:
             return JSONResponse(content={
                 "task_id": task_id, "status": "completed",
-                "progress": "完成!", "message": f"处理完成，共 {len(record.get('segments', []))} 段",
-                "error": None,
                 "segments": record.get("segments", []),
                 "speakers": record.get("speakers", []),
                 "chapters": record.get("chapters", []),
+                "summary": record.get("summary", ""),
+                "message": "从历史记录加载",
             })
         raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
-    resp = {
-        "task_id": task_id, "status": task["status"],
-        "progress": task["progress"], "message": task.get("message"),
-        "error": task.get("error"), "percent": task.get("percent", 0),
+
+    return JSONResponse(content={
+        "task_id": task_id,
+        "status": task.get("status"),
+        "progress": task.get("progress"),
+        "segments": task.get("segments"),
+        "speakers": task.get("speakers"),
+        "chapters": task.get("chapters"),
+        "summary": task.get("summary"),
+        "error": task.get("error"),
+        "message": task.get("message"),
+    })
+
+
+@app.post("/api/task/{task_id}/decisions")
+async def update_task_decisions(task_id: str, decision_payload: dict):
+    """Persist explicit user keep/cut choices before preview or export."""
+    task = tasks.get(task_id)
+    loaded_from_history = False
+    if not task:
+        task = _load_task_from_disk(task_id)
+        loaded_from_history = True
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    decisions = decision_payload.get("decisions", [])
+    if not isinstance(decisions, list):
+        raise HTTPException(status_code=400, detail="decisions must be an array")
+    by_id = {
+        str(item.get("id")): item.get("isKept")
+        for item in decisions
+        if isinstance(item, dict) and isinstance(item.get("isKept"), bool)
     }
-    if task["status"] == "completed":
-        resp["segments"] = task.get("segments", [])
-        resp["speakers"] = task.get("speakers", [])
-        resp["chapters"] = task.get("chapters", [])
-    return JSONResponse(content=resp)
+    updated = 0
+    for segment in task.get("segments", []):
+        key = str(segment.get("id"))
+        if key in by_id:
+            segment["isKept"] = by_id[key]
+            segment["humanDecision"] = "keep" if by_id[key] else "cut"
+            updated += 1
+
+    if loaded_from_history:
+        history = _load_history()
+        for index, record in enumerate(history):
+            if record.get("task_id") == task_id:
+                history[index] = task
+                break
+        with open(HISTORY_FILE, "w", encoding="utf-8") as file:
+            json.dump(history, file, ensure_ascii=False, indent=2)
+    else:
+        _save_task_to_disk(task_id)
+
+    return JSONResponse(content={"status": "ok", "updated": updated})
 
 
 @app.post("/api/export/word/{task_id}")
-async def export_word(task_id: str):
+async def export_word(task_id: str, speaker_names: str = "{}"):
     task = tasks.get(task_id)
     if not task or task.get("status") != "completed":
         record = _load_task_from_disk(task_id)
-        if record:
-            task = record
-        else:
+        if not record:
             raise HTTPException(status_code=404, detail="Task not found or not completed")
+        task = record
+
     try:
-        speaker_names = {s["id"]: s.get("name", s["id"]) for s in task.get("speakers", [])}
-        path = _generate_word(task, speaker_names)
-        return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename="FX281_粗剪文稿.docx")
+        names = json.loads(speaker_names)
+    except:
+        names = {}
+
+    try:
+        file_path = _generate_word(task, names)
+        return FileResponse(file_path, filename=f"FX281_{task_id[:8]}.docx",
+                          media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1149,38 +1258,37 @@ async def export_word(task_id: str):
 async def export_mp3(task_id: str):
     task = tasks.get(task_id)
     if not task or task.get("status") != "completed":
-        raise HTTPException(status_code=404, detail="Task not found or not completed")
-    original = task.get("original_file")
-    if not original or not os.path.exists(original):
-        raise HTTPException(status_code=400, detail="Original audio file not available")
+        record = _load_task_from_disk(task_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Task not found or not completed")
+        task = record
+
+    original_path = task.get("file_path", "")
+    if not original_path or not os.path.exists(original_path):
+        raise HTTPException(status_code=404, detail="Original audio file not found")
+
     try:
-        path = _generate_mp3(task, original)
-        return FileResponse(path, media_type="audio/mpeg", filename="FX281_粗剪版.mp3")
+        file_path = _generate_mp3(task, original_path)
+        return FileResponse(file_path, filename=f"FX281_edited_{task_id[:8]}.mp3",
+                          media_type="audio/mpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist")
-
-if os.path.isdir(STATIC_DIR):
-    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
-
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        file_path = os.path.join(STATIC_DIR, full_path)
-        if full_path and os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+# 后端同源 serve 前端构建产物（dist/），部署时一个服务提供 API + 页面
+from pathlib import Path as _Path
+_dist_dir = _Path(__file__).parent.parent / "dist"
+if _dist_dir.exists():
+    app.mount("/", StaticFiles(directory=str(_dist_dir), html=True), name="frontend")
+    logger.info(f"Serving frontend from: {_dist_dir}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
     logger.info("=" * 50)
-    logger.info("FX281 Podcast Processing API v12.0")
+    logger.info("FX281 Podcast Processing API v13.0")
     logger.info(f"ASR: {'Local SenseVoice (FunASR)' if ASR_MODE == 'local' else 'DashScope sensevoice-v1'}")
-    logger.info(f"Analysis: {QWEN_MODEL} (DashScope)")
+    logger.info(f"Analysis: {LLM_MODEL} ({LLM_PROVIDER})")
     logger.info(f"Data dir: {DATA_DIR}")
-    logger.info(f"Port: {port}")
     logger.info("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=port, timeout_keep_alive=600)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
